@@ -1,0 +1,19 @@
+<aside class="ios-sidebar">
+    <div class="ios-sidebar-header">
+        <div class="ios-sidebar-logo">JH</div>
+        <div class="ios-sidebar-brand">
+            <h3>Student Portal</h3>
+            <span>{{ student_user.full_name or "Student" }}</span>
+        </div>
+    </div>
+    <nav class="ios-sidebar-nav">
+        {% for link in student_sidebar_links %}
+        <a class="ios-sidebar-link {% if request.path == link.url %}active{% endif %}" href="{{ link.url }}">
+            <span>{{ link.label }}</span>
+            {% if link.badge %}
+            <span class="badge badge-blue" style="margin-left: auto;">{{ link.badge }}</span>
+            {% endif %}
+        </a>
+        {% endfor %}
+    </nav>
+</aside>

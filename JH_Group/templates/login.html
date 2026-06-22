@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JH Student Services | Admin Login</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="login-page">
+        <div class="login-card">
+            <div class="login-header">
+                <div class="login-logo">JH</div>
+                <h1 class="login-title">Admin Portal</h1>
+                <p class="login-subtitle">Sign in to access registration and support tools</p>
+            </div>
+
+            <form method="POST" class="login-form">
+                {% if error %}
+                <div class="error-box" style="background: rgba(255, 59, 48, 0.15); color: #FF3B30; border-radius: 12px; padding: 12px 14px; margin-bottom: 16px; font-size: 14px;">
+                    {{ error }}
+                </div>
+                {% endif %}
+
+                <div class="input-group">
+                    <label class="input-label">Email</label>
+                    <input type="text" class="input" name="email" placeholder="admin@jhholdings.co.za" required>
+                </div>
+
+                <div class="input-group">
+                    <label class="input-label">Password</label>
+                    <input type="password" class="input" name="password" placeholder="Enter your password" required>
+                </div>
+
+                <button type="submit" class="btn btn-primary">Sign In</button>
+            </form>
+
+            <div style="text-align: center; margin-top: 24px;">
+                <a href="{{ url_for('student_login') }}" class="btn btn-secondary" style="display: inline-block; text-decoration: none;">
+                    Go to Student Portal
+                </a>
+            </div>
+
+            <div style="margin-top: 32px; padding-top: 24px; border-top: 1px solid var(--border-light);">
+                <p style="font-size: 12px; color: var(--text-tertiary); text-align: center; margin-bottom: 16px;">Demo Accounts</p>
+                <div class="ios-grid-2" style="gap: 12px;">
+                    {% for email, user in users.items() %}
+                    <div class="card" style="padding: 14px; border-radius: 16px;">
+                        <strong style="display: block; margin-bottom: 4px; font-size: 13px;">{{ user.role_label }}</strong>
+                        <span style="font-size: 12px; color: var(--text-secondary);">{{ user.name }}</span>
+                        <p style="font-size: 11px; color: var(--text-tertiary); margin-top: 8px;">{{ email }}</p>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

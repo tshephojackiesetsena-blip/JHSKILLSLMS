@@ -1,0 +1,4297 @@
+import json
+import os
+import secrets
+import string
+import smtplib
+from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from functools import wraps
+
+from flask import Flask, jsonify, redirect, render_template_string, request, send_from_directory, session, url_for
+from werkzeug.exceptions import NotFound
+from werkzeug.utils import secure_filename
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "jh_student_portal_secret_dev")
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
+
+# Trust the reverse-proxy headers from Render/Heroku so HTTPS works correctly
+# This is required for camera/microphone to work (browsers need a secure context)
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+
+MAX_DOCUMENT_MB = 5
+ALLOWED_DOCUMENT_EXTENSIONS = {"pdf", "png", "jpg", "jpeg", "doc", "docx"}
+LEARNER_DOCUMENT_TYPES = [
+    {"id": "id_copy", "label": "Copy of ID", "description": "Certified or clear scan of South African ID or passport.", "required": True},
+    {"id": "proof_of_address", "label": "Proof of Address", "description": "Utility bill, bank statement, or official proof not older than 3 months.", "required": True},
+    {"id": "qualification", "label": "Qualifications", "description": "Latest certificate, statement of results, or academic proof.", "required": True},
+    {"id": "cv", "label": "CV", "description": "Updated curriculum vitae in PDF or Word format.", "required": True},
+    {"id": "funding_letter", "label": "Funding Letter", "description": "Bursary, NSFAS, or sponsor confirmation letter.", "required": False},
+    {"id": "other_supporting", "label": "Other Supporting Documents", "description": "Any extra supporting files requested by the institution.", "required": False},
+]
+DOCUMENT_TYPE_LOOKUP = {item["id"]: item for item in LEARNER_DOCUMENT_TYPES}
+
+DATA_DIR = os.path.join(app.root_path, "data")
+LEARNER_UPLOADS_DIR = os.path.join(app.root_path, "static", "uploads", "learners")
+LEARNER_DOCUMENTS_FILE = os.path.join(DATA_DIR, "learner_documents.json")
+CENTRAL_UPLOADS_DIR = os.path.join(app.root_path, "static", "uploads", "documents")
+CENTRAL_DOCUMENTS_FILE = os.path.join(DATA_DIR, "central_documents.json")
+STUDENTS_FILE = os.path.join(DATA_DIR, "students.json")
+MESSAGES_FILE = os.path.join(DATA_DIR, "messages.json")
+PENDING_FILE    = os.path.join(DATA_DIR, "pending_registrations.json")
+VERIF_FILE      = os.path.join(DATA_DIR, "verification_tokens.json")
+EMAIL_CONFIG_FILE = os.path.join(DATA_DIR, "email_config.json")
+MEET_ROOMS_FILE = os.path.join(DATA_DIR, "meet_rooms.json")
+
+# ── Email config ──────────────────────────────────────────────────────────
+# Values are read live from data/email_config.json (set via Admin > Settings).
+# Environment variables are used as fallback if the file doesn't exist yet.
+APP_BASE_URL  = os.environ.get("APP_BASE_URL", "http://localhost:5000")
+
+def load_email_config():
+    """Read SMTP config from file, falling back to env vars."""
+    try:
+        if os.path.exists(EMAIL_CONFIG_FILE):
+            with open(EMAIL_CONFIG_FILE, "r") as f:
+                cfg = json.load(f)
+            if cfg.get("mail_user") and cfg.get("mail_pass"):
+                return cfg
+    except Exception:
+        pass
+    # Env var fallback
+    return {
+        "mail_host": os.environ.get("MAIL_HOST", "smtp.gmail.com"),
+        "mail_port": int(os.environ.get("MAIL_PORT", "587")),
+        "mail_user": os.environ.get("MAIL_USER", ""),
+        "mail_pass": os.environ.get("MAIL_PASS", ""),
+        "mail_from": os.environ.get("MAIL_FROM", os.environ.get("MAIL_USER", "")),
+    }
+
+def save_email_config(cfg):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(EMAIL_CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+# ── SMS / OTP config (Twilio) ─────────────────────────────────────────────
+TWILIO_SID    = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM   = os.environ.get("TWILIO_FROM_NUMBER", "")  # e.g. +12345678900
+
+JH_GROUP = {
+    "name": "JH Student Services",
+    "tagline": "Administration, learning support, and student success operations.",
+    "companies": [],
+}
+
+LEARNING_INTERVENTIONS = []
+
+STUDENT_TASKS = []
+
+STUDENT_NOTES = []
+
+TIMETABLE_ITEMS = []
+
+ANNOUNCEMENTS = []
+
+CAMPUS_SERVICES = [
+    {"name": "Accommodation Booking", "status": "Applications Open", "detail": "Track room placement and submit housing updates."},
+    {"name": "Library Resources", "status": "Available", "detail": "Reserve books, use e-journals, and renew issued material."},
+    {"name": "Sports Facilities", "status": "Booking Required", "detail": "Book gym sessions, courts, and student activities."},
+]
+
+SUPPORT_SERVICES = [
+    {"name": "Student Counselling", "contact": "counselling@jhstudent.co.za", "detail": "Confidential personal and academic support."},
+    {"name": "Campus Healthcare", "contact": "clinic@jhstudent.co.za", "detail": "Primary healthcare, wellness, and screening services."},
+    {"name": "IT Help Desk", "contact": "itsupport@jhstudent.co.za", "detail": "Portal login, LMS, Wi-Fi, and device support."},
+]
+
+ADMIN_USERS = {
+    "admin@jhstudent.co.za": {"password": "Admin@123", "name": "Admin User", "role": "admin", "role_label": "Super Admin", "default_route": "admin_dashboard"},
+    "reception@jhstudent.co.za": {"password": "Reception@123", "name": "Receptionist", "role": "receptionist", "role_label": "Receptionist", "default_route": "receptionist_dashboard"},
+    "client@jhstudent.co.za": {"password": "Client@123", "name": "Client User", "role": "client", "role_label": "Client", "default_route": "client_dashboard"},
+}
+
+STUDENT_SEED = []
+
+
+# ── Storage helpers ─────────────────────────────────────────────────────────
+def ensure_storage():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(LEARNER_UPLOADS_DIR, exist_ok=True)
+    os.makedirs(CENTRAL_UPLOADS_DIR, exist_ok=True)
+    # Only create files if they don't exist, don't try to overwrite
+    if not os.path.exists(LEARNER_DOCUMENTS_FILE):
+        with open(LEARNER_DOCUMENTS_FILE, "w") as f: json.dump({}, f)
+    if not os.path.exists(CENTRAL_DOCUMENTS_FILE):
+        with open(CENTRAL_DOCUMENTS_FILE, "w") as f: json.dump([], f)
+    if not os.path.exists(STUDENTS_FILE):
+        with open(STUDENTS_FILE, "w") as f: json.dump(STUDENT_SEED, f, indent=2)
+    if not os.path.exists(MESSAGES_FILE):
+        with open(MESSAGES_FILE, "w") as f: json.dump([], f)
+    if not os.path.exists(PENDING_FILE):
+        with open(PENDING_FILE, "w") as f: json.dump([], f)
+    if not os.path.exists(VERIF_FILE):
+        with open(VERIF_FILE, "w") as f: json.dump({}, f)
+    if not os.path.exists(MEET_ROOMS_FILE):
+        with open(MEET_ROOMS_FILE, "w") as f: json.dump({}, f)
+
+def load_json(path, default):
+    ensure_storage()
+    with open(path, "r") as f: return json.load(f) if os.path.getsize(path) else default
+
+def save_json(path, data):
+    ensure_storage()
+    with open(path, "w") as f: json.dump(data, f, indent=2)
+
+def load_students(): return load_json(STUDENTS_FILE, [])
+def save_students(s): save_json(STUDENTS_FILE, s)
+
+def get_student_by_id(sid):
+    for s in load_students():
+        if str(s["id"]) == str(sid): return s
+    return None
+
+def get_student_by_username(username):
+    username = username.strip().lower()
+    for s in load_students():
+        if s["username"].lower() == username: return s
+    return None
+
+def load_meet_rooms(): return load_json(MEET_ROOMS_FILE, {})
+def save_meet_rooms(r): save_json(MEET_ROOMS_FILE, r)
+
+def generate_join_code():
+    """Generate a short 6-character alphanumeric join code."""
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(6))
+
+def create_meet_room(title, creator_name):
+    """Admin creates a meeting room; returns the join code and jitsi room name."""
+    rooms = load_meet_rooms()
+    for _ in range(20):
+        code = generate_join_code()
+        if code not in rooms:
+            break
+    jitsi_room = "jh-" + secrets.token_hex(8)
+    rooms[code] = {
+        "code": code,
+        "title": title or "JH Meeting",
+        "jitsi_room": jitsi_room,
+        "creator": creator_name,
+        "created_at": int(datetime.now().timestamp()),
+        "active": True,
+    }
+    save_meet_rooms(rooms)
+    return rooms[code]
+
+def get_room_by_code(code):
+    rooms = load_meet_rooms()
+    return rooms.get(code.strip().upper())
+
+# ── Pending registrations ─────────────────────────────────────────────────
+def load_pending(): return load_json(PENDING_FILE, [])
+def save_pending(p): save_json(PENDING_FILE, p)
+
+# ── Verification tokens ───────────────────────────────────────────────────
+def load_verif(): return load_json(VERIF_FILE, {})
+def save_verif(v): save_json(VERIF_FILE, v)
+
+def _ensure_extra_files():
+    for path, default in [(PENDING_FILE, []), (VERIF_FILE, {})]:
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                json.dump(default, f)
+
+def create_email_token(pending_id):
+    """Generate a one-time email verification link token."""
+    _ensure_extra_files()
+    token = secrets.token_urlsafe(32)
+    store = load_verif()
+    store[f"email:{pending_id}"] = {
+        "token": token,
+        "expires": (datetime.now() + timedelta(hours=24)).isoformat(),
+        "used": False,
+    }
+    save_verif(store)
+    return token
+
+def create_phone_otp(pending_id):
+    """Generate a 6-digit SMS OTP."""
+    _ensure_extra_files()
+    otp = "".join(secrets.choice(string.digits) for _ in range(6))
+    store = load_verif()
+    store[f"otp:{pending_id}"] = {
+        "otp": otp,
+        "expires": (datetime.now() + timedelta(minutes=15)).isoformat(),
+        "used": False,
+        "attempts": 0,
+    }
+    save_verif(store)
+    return otp
+
+def verify_email_token(pending_id, token):
+    store = load_verif()
+    key = f"email:{pending_id}"
+    rec = store.get(key)
+    if not rec or rec["used"]: return False
+    if datetime.now() > datetime.fromisoformat(rec["expires"]): return False
+    if rec["token"] != token: return False
+    rec["used"] = True
+    save_verif(store)
+    return True
+
+def verify_phone_otp(pending_id, otp):
+    store = load_verif()
+    key = f"otp:{pending_id}"
+    rec = store.get(key)
+    if not rec or rec["used"]: return False, "OTP already used or not found."
+    if datetime.now() > datetime.fromisoformat(rec["expires"]): return False, "OTP has expired. Please resend."
+    rec["attempts"] = rec.get("attempts", 0) + 1
+    if rec["attempts"] > 5:
+        save_verif(store)
+        return False, "Too many attempts. Please resend the OTP."
+    if rec["otp"] != otp:
+        save_verif(store)
+        return False, "Incorrect OTP. Please try again."
+    rec["used"] = True
+    save_verif(store)
+    return True, "ok"
+
+# ── Email sender ──────────────────────────────────────────────────────────
+def send_email(to_addr, subject, html_body):
+    """Send an email via SMTP. Reads credentials live from config file or env vars."""
+    cfg = load_email_config()
+    mail_user = cfg.get("mail_user", "")
+    mail_pass = cfg.get("mail_pass", "")
+    mail_from = cfg.get("mail_from", "") or mail_user
+    mail_host = cfg.get("mail_host", "smtp.gmail.com")
+    mail_port = int(cfg.get("mail_port", 587))
+
+    if not mail_user or not mail_pass:
+        print(f"[EMAIL - not configured] To: {to_addr}  Subject: {subject}")
+        return False
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = mail_from
+        msg["To"]      = to_addr
+        msg.attach(MIMEText(html_body, "html"))
+        with smtplib.SMTP(mail_host, mail_port) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(mail_user, mail_pass)
+            server.sendmail(mail_from, to_addr, msg.as_string())
+        return True
+    except Exception as e:
+        print(f"[EMAIL ERROR] {e}")
+        return str(e)
+
+def send_verification_email(to_addr, full_name, pending_id, token):
+    link = f"{APP_BASE_URL}/verify-email?id={pending_id}&token={token}"
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e0e0e0">
+      <div style="background:linear-gradient(135deg,#8DC63F,#00A89D);padding:28px 32px">
+        <h1 style="color:#fff;margin:0;font-size:22px">JH Student Portal</h1>
+        <p style="color:rgba(255,255,255,.85);margin:4px 0 0;font-size:14px">Email Verification</p>
+      </div>
+      <div style="padding:32px">
+        <p style="font-size:15px;color:#222">Hi <strong>{full_name}</strong>,</p>
+        <p style="font-size:14px;color:#555">Thank you for registering. Please verify your email address to continue:</p>
+        <div style="text-align:center;margin:28px 0">
+          <a href="{link}" style="background:linear-gradient(135deg,#8DC63F,#00A89D);color:#fff;text-decoration:none;padding:14px 32px;border-radius:8px;font-size:15px;font-weight:700;display:inline-block">
+            ✅ Verify Email Address
+          </a>
+        </div>
+        <p style="font-size:12px;color:#999">This link expires in 24 hours. If you did not register, please ignore this email.</p>
+      </div>
+    </div>"""
+    return send_email(to_addr, "Verify your email — JH Student Portal", html)
+
+def send_otp_sms(phone_number, otp, full_name):
+    """Send OTP via Twilio SMS. Falls back to print if not configured."""
+    message_body = f"Hi {full_name.split()[0]}, your JH Portal OTP is: {otp}. Valid for 15 minutes. Do not share this code."
+    if not TWILIO_SID or not TWILIO_TOKEN or not TWILIO_FROM:
+        print(f"[SMS - not configured] To: {phone_number}  OTP: {otp}")
+        return False
+    try:
+        import urllib.request, urllib.parse, base64
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Messages.json"
+        data = urllib.parse.urlencode({
+            "From": TWILIO_FROM,
+            "To": phone_number,
+            "Body": message_body,
+        }).encode()
+        credentials = base64.b64encode(f"{TWILIO_SID}:{TWILIO_TOKEN}".encode()).decode()
+        req = urllib.request.Request(url, data=data, headers={"Authorization": f"Basic {credentials}"})
+        urllib.request.urlopen(req, timeout=10)
+        return True
+    except Exception as e:
+        print(f"[SMS ERROR] {e}")
+        return False
+
+def send_approval_email(to_addr, full_name, username, password):
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e0e0e0">
+      <div style="background:linear-gradient(135deg,#8DC63F,#00A89D);padding:28px 32px">
+        <h1 style="color:#fff;margin:0;font-size:22px">JH Student Portal</h1>
+        <p style="color:rgba(255,255,255,.85);margin:4px 0 0;font-size:14px">Registration Approved 🎉</p>
+      </div>
+      <div style="padding:32px">
+        <p style="font-size:15px;color:#222">Hi <strong>{full_name}</strong>,</p>
+        <p style="font-size:14px;color:#555">Your registration has been approved by our admin team. You can now sign in to the portal:</p>
+        <div style="background:#f5faf3;border:1px solid #c8e0c0;border-radius:8px;padding:16px 20px;margin:20px 0;font-size:14px">
+          <div style="margin-bottom:6px"><strong>Username:</strong> <code>{username}</code></div>
+          <div><strong>Password:</strong> <code>{password}</code></div>
+        </div>
+        <div style="text-align:center;margin:20px 0">
+          <a href="{APP_BASE_URL}/" style="background:linear-gradient(135deg,#8DC63F,#00A89D);color:#fff;text-decoration:none;padding:14px 32px;border-radius:8px;font-size:15px;font-weight:700;display:inline-block">
+            Sign In to Portal →
+          </a>
+        </div>
+        <p style="font-size:12px;color:#999">We recommend changing your password after your first login.</p>
+      </div>
+    </div>"""
+    return send_email(to_addr, "Your JH Portal account is approved — Welcome!", html)
+
+def load_learner_document_store(): return load_json(LEARNER_DOCUMENTS_FILE, {})
+def save_learner_document_store(s): save_json(LEARNER_DOCUMENTS_FILE, s)
+def load_central_document_store(): return load_json(CENTRAL_DOCUMENTS_FILE, [])
+def save_central_document_store(s): save_json(CENTRAL_DOCUMENTS_FILE, s)
+
+def is_allowed_document(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_DOCUMENT_EXTENSIONS
+
+def build_document_payload(learner_id, doc):
+    d = dict(doc)
+    d["view_url"] = url_for("learner_document_file", learner_id=learner_id, filename=doc["stored_name"])
+    d["download_url"] = url_for("learner_document_file", learner_id=learner_id, filename=doc["stored_name"], download=1)
+    return d
+
+def get_learner_documents(learner_id):
+    store = load_learner_document_store()
+    return [build_document_payload(learner_id, r) for r in store.get(str(learner_id), [])]
+
+def get_document_checklist(learner_id):
+    docs = get_learner_documents(learner_id)
+    cats = {d["category"] for d in docs}
+    checklist = []
+    for dt in LEARNER_DOCUMENT_TYPES:
+        matching = [d for d in docs if d["category"] == dt["id"]]
+        checklist.append({**dt, "uploaded": bool(matching), "count": len(matching), "documents": matching})
+    return {
+        "required_total": len([x for x in LEARNER_DOCUMENT_TYPES if x["required"]]),
+        "required_uploaded": len([x for x in LEARNER_DOCUMENT_TYPES if x["required"] and x["id"] in cats]),
+        "items": checklist,
+    }
+
+def current_admin():
+    if not session.get("admin_logged_in"): return None
+    admin = ADMIN_USERS.get(session.get("admin_email", "").lower())
+    if admin and admin.get("role") == "admin":
+        return admin
+    return None
+
+def current_receptionist():
+    if not session.get("admin_logged_in"): return None
+    admin = ADMIN_USERS.get(session.get("admin_email", "").lower())
+    if admin and admin.get("role") == "receptionist":
+        return admin
+    return None
+
+def current_client():
+    if not session.get("admin_logged_in"): return None
+    admin = ADMIN_USERS.get(session.get("admin_email", "").lower())
+    if admin and admin.get("role") == "client":
+        return admin
+    return None
+
+def current_student():
+    if not session.get("student_logged_in"): return None
+    return get_student_by_id(session.get("student_id"))
+
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not current_admin(): return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return wrapper
+
+def receptionist_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not current_receptionist(): return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return wrapper
+
+def client_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not current_client(): return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return wrapper
+
+def student_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not current_student(): return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return wrapper
+
+def create_student_payload(form_data, current_count):
+    n = 1000 + current_count + 1
+    sid = str(n)
+    full_name = form_data["full_name"].strip()
+    first_name = full_name.split()[0].lower()
+    return {
+        "id": sid, "student_number": f"2026{sid}", "full_name": full_name,
+        "email": form_data["email"].strip(), "phone": form_data["phone"].strip(),
+        "id_number": form_data["id_number"].strip(), "gender": form_data["gender"].strip(),
+        "address": form_data["address"].strip(), "employment": form_data["employment"].strip(),
+        "qualification": form_data["qualification"].strip(), "faculty": form_data["faculty"].strip(),
+        "programme": form_data["programme"].strip(), "coordinator": form_data["coordinator"].strip(),
+        "location": form_data["location"].strip(), "start_date": form_data["start_date"].strip(),
+        "status": form_data["status"].strip(), "username": f"learner.jh-{sid}",
+        "password": f"Learner@{sid}", "campus": form_data["location"].strip(),
+        "year_level": form_data["year_level"].strip(),
+        "emergency_contact_name": form_data["emergency_contact_name"].strip(),
+        "emergency_contact_phone": form_data["emergency_contact_phone"].strip(),
+        "emergency_contact_relationship": form_data["emergency_contact_relationship"].strip(),
+        "modules": [x.strip() for x in form_data["modules"].split(",") if x.strip()],
+        "tuition_balance": form_data["tuition_balance"].strip() or "R0",
+        "bursary_status": form_data["bursary_status"].strip() or "Pending",
+        "registration_status": "Registered", "lms_link": "https://canvas.instructure.com/",
+        "portal_email": f"{first_name}.{sid}@student.jh.co.za",
+    }
+
+
+# ── Shared CSS / JS (theme system) ──────────────────────────────────────────
+BASE_STYLES = """
+/* JH Skills Development Theme */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+:root {
+  /* JH Brand Colors */
+  --jh-primary: #10B981;
+  --jh-primary-light: #34D399;
+  --jh-secondary: #84CC16;
+  --jh-secondary-light: #A3E635;
+  --jh-grad: linear-gradient(135deg, #84CC16 0%, #10B981 100%);
+  --jh-bg-gradient-light: linear-gradient(135deg, #8B9A3C 0%, #A7C45F 50%, #C6E278 100%);
+  --jh-bg-gradient-dark: linear-gradient(135deg, #061F18 0%, #0A3328 50%, #0E4232 100%);
+  --jh-card-bg-light: rgba(255, 255, 255, 0.8);
+  --jh-card-bg-dark: rgba(10, 51, 40, 0.8);
+  --jh-teal: var(--jh-primary);
+  --jh-green: var(--jh-primary);
+  --jh-dark: #064E3B;
+  
+  --ios-blue: var(--jh-primary);
+  --ios-blue-light: var(--jh-primary-light);
+  --ios-purple: #AF52DE;
+  --ios-pink: #FF375F;
+  --ios-red: #FF3B30;
+  --ios-orange: #FF9500;
+  --ios-yellow: #FFCC00;
+  --ios-green: var(--jh-primary);
+  --ios-teal: #5AC8FA;
+  --gradient-ios-1: var(--jh-grad);
+  --gradient-hero: var(--jh-bg-gradient-light);
+  --bg-primary: #F0FDF4;
+  --bg-secondary: #ECFDF5;
+  --bg-card: var(--jh-card-bg-light);
+  --bg-glass: rgba(16, 185, 129, 0.1);
+  --bg-glass-dark: rgba(0, 0, 0, 0.05);
+  --text-primary: #064E3B;
+  --text-secondary: rgba(6, 78, 59, 0.7);
+  --text-tertiary: rgba(6, 78, 59, 0.5);
+  --border-light: rgba(16, 185, 129, 0.2);
+  --border-medium: rgba(16, 185, 129, 0.3);
+  --shadow-glow-blue: 0 0 40px rgba(16, 185, 129, 0.3);
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-2xl: 48px;
+  --radius-xs: 8px;
+  --radius-sm: 12px;
+  --radius-md: 16px;
+  --radius-lg: 20px;
+  --radius-xl: 28px;
+  --radius-2xl: 36px;
+  --radius-full: 9999px;
+  --ease-out: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  --ease-spring: cubic-bezier(0.175, 0.885, 0.32, 1.275);
+  --duration-fast: 150ms;
+  --duration-normal: 250ms;
+  --duration-slow: 400ms;
+  /* Backward compatibility vars */
+  --brand: var(--jh-primary);
+  --bg: var(--bg-primary);
+  --bg-2: var(--bg-secondary);
+  --surface: var(--bg-card);
+  --surface-2: var(--bg-glass-dark);
+  --border: var(--border-light);
+  --text: var(--text-primary);
+  --text-2: var(--text-secondary);
+  --text-3: var(--text-tertiary);
+  --sidebar-bg: var(--bg-secondary);
+  --sidebar-text: var(--text-secondary);
+  --sidebar-active: var(--text-primary);
+  --sidebar-active-bg: rgba(16, 185, 129, 0.2);
+  --shadow: 0 2px 16px rgba(0,0,0,.15);
+  --shadow-lg: 0 8px 40px rgba(0,0,0,.25);
+  --r: var(--radius-xl);
+  --r-sm: var(--radius-md);
+  --trans: var(--duration-normal) var(--ease-out);
+}
+
+/* Light Mode (Default) */
+body.light-mode,
+[data-theme="light"] {
+  --gradient-hero: var(--jh-bg-gradient-light);
+  --bg-primary: #F0FDF4;
+  --bg-secondary: #FFFFFF;
+  --bg-card: var(--jh-card-bg-light);
+  --bg-glass: rgba(16, 185, 129, 0.1);
+  --bg-glass-dark: rgba(0, 0, 0, 0.05);
+  --text-primary: #064E3B;
+  --text-secondary: rgba(6, 78, 59, 0.7);
+  --text-tertiary: rgba(6, 78, 59, 0.5);
+  --border-light: rgba(16, 185, 129, 0.2);
+  --border-medium: rgba(16, 185, 129, 0.3);
+}
+
+/* Dark Mode */
+body.dark-mode,
+[data-theme="dark"] {
+  --gradient-hero: var(--jh-bg-gradient-dark);
+  --bg-primary: #061F18;
+  --bg-secondary: #0A3328;
+  --bg-card: var(--jh-card-bg-dark);
+  --bg-glass: rgba(52, 211, 153, 0.1);
+  --bg-glass-dark: rgba(0, 0, 0, 0.3);
+  --text-primary: #ECFDF5;
+  --text-secondary: rgba(236, 253, 245, 0.7);
+  --text-tertiary: rgba(236, 253, 245, 0.5);
+  --border-light: rgba(52, 211, 153, 0.2);
+  --border-medium: rgba(52, 211, 153, 0.3);
+}
+
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+html { font-size: 16px; -webkit-font-smoothing: antialiased; }
+body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg-primary); color: var(--text-primary); min-height: 100vh; line-height: 1.5; }
+a { color: inherit; text-decoration: none; }
+button { font-family: inherit; cursor: pointer; border: none; background: none; }
+input, textarea, select { font-family: inherit; }
+
+.font-display { font-weight: 700; letter-spacing: -0.02em; }
+.text-gradient { background: linear-gradient(135deg, var(--ios-blue) 0%, var(--ios-purple) 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+
+.glass { background: var(--bg-glass); backdrop-filter: blur(40px); -webkit-backdrop-filter: blur(40px); border: 1px solid var(--border-light); }
+.glass-card { background: var(--bg-card); backdrop-filter: blur(40px); border-radius: var(--radius-xl); border: 1px solid var(--border-light); }
+
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: var(--space-sm); padding: var(--space-md) var(--space-lg); border-radius: var(--radius-lg); font-weight: 600; font-size: 15px; transition: all var(--duration-normal) var(--ease-out); cursor: pointer; border: none; }
+.btn-primary { background: var(--ios-blue); color: white; box-shadow: 0 4px 16px rgba(0, 122, 255, 0.3); }
+.btn-primary:hover { background: var(--ios-blue-light); transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0, 122, 255, 0.4); }
+.btn-secondary { background: var(--bg-glass); color: var(--text-primary); border: 1px solid var(--border-medium); }
+.btn-success { background: var(--ios-green); color: white; }
+.btn-danger { background: var(--ios-red); color: white; }
+.btn-pill { border-radius: var(--radius-full); padding: var(--space-sm) var(--space-lg); }
+.btn-sm { padding: 6px 12px; font-size: 12px; }
+.btn-ghost { background: none; color: var(--text-secondary); border: none; }
+.btn-ghost:hover { color: var(--ios-blue); }
+
+.card { background: var(--bg-card); border-radius: var(--radius-xl); padding: var(--space-lg); border: 1px solid var(--border-light); transition: all var(--duration-normal) var(--ease-out); }
+.card:hover { border-color: var(--border-medium); transform: translateY(-2px); }
+.widget { background: var(--bg-card); border-radius: var(--radius-2xl); padding: var(--space-lg); border: 1px solid var(--border-light); position: relative; overflow: hidden; }
+.card-title { font-weight: 700; font-size: 15px; color: var(--text-primary); margin-bottom: 12px; }
+
+.input-group { margin-bottom: var(--space-md); }
+.input-label { display: block; font-size: 13px; font-weight: 500; color: var(--text-secondary); margin-bottom: var(--space-sm); }
+.input { width: 100%; padding: var(--space-md); background: var(--bg-glass-dark); border: 1px solid var(--border-light); border-radius: var(--radius-md); color: var(--text-primary); font-size: 16px; transition: all var(--duration-fast) var(--ease-out); outline: none; }
+.input:focus { border-color: var(--ios-blue); box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.2); }
+.input::placeholder { color: var(--text-tertiary); }
+
+.ios-nav { position: fixed; bottom: 0; left: 0; right: 0; height: 84px; background: var(--bg-glass); backdrop-filter: blur(40px); border-top: 1px solid var(--border-light); display: flex; justify-content: space-around; align-items: flex-start; padding-top: var(--space-sm); z-index: 1000; }
+.ios-nav-item { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: var(--space-xs) var(--space-md); color: var(--text-tertiary); transition: all var(--duration-fast); }
+.ios-nav-item.active { color: var(--ios-blue); }
+.ios-nav-item span { font-size: 10px; font-weight: 500; }
+
+.ios-sidebar { position: fixed; left: 0; top: 0; bottom: 0; width: 280px; background: var(--bg-secondary); border-right: 1px solid var(--border-light); padding: var(--space-lg); z-index: 100; overflow-y: auto; }
+.ios-sidebar-header { display: flex; align-items: center; gap: var(--space-md); padding-bottom: var(--space-lg); border-bottom: 1px solid var(--border-light); margin-bottom: var(--space-lg); }
+.ios-sidebar-logo { width: 44px; height: 44px; border-radius: var(--radius-md); background: var(--gradient-ios-1); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 18px; color: white; }
+.ios-sidebar-brand h3 { font-size: 17px; font-weight: 600; }
+.ios-sidebar-brand span { font-size: 13px; color: var(--text-secondary); }
+.ios-sidebar-nav { display: flex; flex-direction: column; gap: var(--space-xs); }
+.ios-sidebar-link { display: flex; align-items: center; gap: var(--space-md); padding: var(--space-md); border-radius: var(--radius-md); color: var(--text-secondary); transition: all var(--duration-fast); }
+.ios-sidebar-link:hover { background: var(--bg-glass); color: var(--text-primary); }
+.ios-sidebar-link.active { background: var(--ios-blue); color: white; box-shadow: var(--shadow-glow-blue); }
+.ios-sidebar-link svg { width: 20px; height: 20px; flex-shrink: 0; }
+.ios-sidebar-link span { font-size: 15px; font-weight: 500; }
+
+.ios-main { margin-left: 280px; min-height: 100vh; padding: var(--space-lg); padding-bottom: 100px; }
+.ios-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-xl); }
+.ios-header-title h1 { font-size: 34px; font-weight: 700; letter-spacing: -0.02em; margin-bottom: var(--space-xs); }
+.ios-header-title p { color: var(--text-secondary); font-size: 15px; }
+
+.ios-hero { background: var(--gradient-hero); border-radius: var(--radius-2xl); padding: var(--space-2xl); margin-bottom: var(--space-xl); position: relative; overflow: hidden; }
+.ios-hero::before { content: ''; position: absolute; top: -50%; right: -20%; width: 60%; height: 200%; background: radial-gradient(circle, rgba(0,122,255,0.15) 0%, transparent 70%); }
+.ios-hero-content { position: relative; z-index: 1; }
+.ios-hero h1 { font-size: 42px; font-weight: 700; margin-bottom: var(--space-md); letter-spacing: -0.03em; }
+.ios-hero p { font-size: 17px; color: var(--text-secondary); max-width: 500px; }
+
+.ios-stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--space-md); margin-bottom: var(--space-xl); }
+.ios-stat-card { background: var(--bg-card); border-radius: var(--radius-xl); padding: var(--space-lg); border: 1px solid var(--border-light); position: relative; overflow: hidden; }
+.ios-stat-card::before { content: ''; position: absolute; top: 0; right: 0; width: 80px; height: 80px; border-radius: 50%; opacity: 0.1; transform: translate(20px, -20px); }
+.ios-stat-card.blue::before { background: var(--ios-blue); }
+.ios-stat-card.green::before { background: var(--ios-green); }
+.ios-stat-card.purple::before { background: var(--ios-purple); }
+.ios-stat-card.pink::before { background: var(--ios-pink); }
+.ios-stat-icon { width: 40px; height: 40px; border-radius: var(--radius-md); display: flex; align-items: center; justify-content: center; margin-bottom: var(--space-md); }
+.ios-stat-icon.blue { background: rgba(0, 122, 255, 0.15); color: var(--ios-blue); }
+.ios-stat-icon.green { background: rgba(52, 199, 89, 0.15); color: var(--ios-green); }
+.ios-stat-icon.purple { background: rgba(175, 82, 222, 0.15); color: var(--ios-purple); }
+.ios-stat-label { font-size: 13px; color: var(--text-secondary); margin-bottom: var(--space-xs); }
+.ios-stat-value { font-size: 32px; font-weight: 700; letter-spacing: -0.02em; }
+
+.ios-grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--space-lg); }
+.ios-grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-lg); }
+
+.badge { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: var(--radius-full); font-size: 12px; font-weight: 600; }
+.badge-blue { background: rgba(0, 122, 255, 0.15); color: var(--ios-blue); }
+.badge-green { background: rgba(52, 199, 89, 0.15); color: var(--ios-green); }
+.badge-purple { background: rgba(175, 82, 222, 0.15); color: var(--ios-purple); }
+.badge-pink { background: rgba(255, 55, 95, 0.15); color: var(--ios-pink); }
+.badge-red { background: rgba(255, 59, 48, 0.15); color: var(--ios-red); }
+.badge-orange { background: rgba(255, 149, 0, 0.15); color: var(--ios-orange); }
+.badge-teal { background: rgba(0, 122, 255, 0.15); color: var(--ios-blue); }
+.badge-gray { background: var(--bg-glass-dark); color: var(--text-secondary); }
+
+.progress-bar { width: 100%; height: 6px; background: var(--bg-glass-dark); border-radius: var(--radius-full); overflow: hidden; }
+.progress-bar-fill { height: 100%; border-radius: var(--radius-full); }
+.progress-bar-fill.blue { background: var(--ios-blue); }
+.progress-bar-fill.green { background: var(--ios-green); }
+.progress-fill { height: 100%; border-radius: var(--radius-full); background: var(--ios-blue); transition: width .8s ease; }
+
+.ios-table { width: 100%; border-collapse: collapse; }
+.ios-table th, .ios-table td { padding: var(--space-md); text-align: left; border-bottom: 1px solid var(--border-light); }
+.ios-table th { font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; }
+.ios-table td { font-size: 15px; }
+
+.login-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--bg-primary); padding: var(--space-lg); }
+.login-card { width: 100%; max-width: 440px; background: var(--bg-card); border-radius: var(--radius-2xl); border: 1px solid var(--border-light); padding: var(--space-2xl); backdrop-filter: blur(40px); }
+.login-header { text-align: center; margin-bottom: var(--space-2xl); }
+.login-logo { width: 72px; height: 72px; border-radius: var(--radius-xl); background: var(--gradient-ios-1); display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: 700; color: white; margin: 0 auto var(--space-lg); box-shadow: var(--shadow-glow-blue); }
+.login-title { font-size: 28px; font-weight: 700; margin-bottom: var(--space-sm); }
+.login-subtitle { color: var(--text-secondary); font-size: 15px; }
+.login-form .input-group { margin-bottom: var(--space-lg); }
+.login-form .btn { width: 100%; padding: var(--space-md); font-size: 17px; }
+
+.flex { display: flex; }
+.flex-col { flex-direction: column; }
+.items-center { align-items: center; }
+.justify-between { justify-content: space-between; }
+.gap-md { gap: var(--space-md); }
+.gap-lg { gap: var(--space-lg); }
+.text-center { text-align: center; }
+.w-full { width: 100%; }
+.mb-lg { margin-bottom: var(--space-lg); }
+
+/* Backward compatibility for existing classes */
+.main-content { margin-left: 280px; min-height: 100vh; padding: var(--space-lg); padding-bottom: 100px; }
+.topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; gap: 20px; flex-wrap: wrap; height: auto; background: transparent; border-bottom: none; position: static; box-shadow: none; }
+.topbar-title { font-weight: 700; font-size: 16px; color: var(--text-primary); flex: 1; }
+.topbar-actions { display: flex; align-items: center; gap: 10px; }
+.search-bar { display: flex; align-items: center; gap: 8px; background: var(--bg-glass-dark); border: 1px solid var(--border-light); border-radius: var(--radius-md); padding: 6px 12px; transition: border-color var(--duration-fast); }
+.search-bar:focus-within { border-color: var(--ios-blue); }
+.search-bar input { background: none; border: none; outline: none; color: var(--text-primary); font-size: 13px; width: 180px; }
+.search-bar input::placeholder { color: var(--text-tertiary); }
+.page { padding: 0; flex: 1; }
+.page-header { margin-bottom: var(--space-xl); }
+.page-header h1 { font-size: 34px; font-weight: 700; letter-spacing: -0.02em; margin-bottom: var(--space-xs); }
+.page-header p { color: var(--text-secondary); font-size: 15px; margin-top: 4px; }
+.grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--space-lg); }
+.grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-lg); }
+.grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--space-md); }
+.stat-card { background: var(--bg-card); border-radius: var(--radius-xl); padding: var(--space-lg); border: 1px solid var(--border-light); position: relative; overflow: hidden; }
+.stat-card::before { content: ''; position: absolute; top: 0; right: 0; width: 80px; height: 80px; border-radius: 50%; opacity: 0.1; transform: translate(20px, -20px); background: var(--ios-blue); }
+.stat-icon { width: 40px; height: 40px; border-radius: var(--radius-md); display: flex; align-items: center; justify-content: center; margin-bottom: var(--space-md); background: rgba(0, 122, 255, 0.15); color: var(--ios-blue); }
+.stat-value { font-size: 32px; font-weight: 700; letter-spacing: -0.02em; }
+.stat-label { font-size: 13px; color: var(--text-secondary); margin-bottom: var(--space-xs); }
+.stat-change { font-size: 11px; margin-top: 8px; display: flex; align-items: center; gap: 4px; }
+.stat-change.up { color: var(--ios-green); }
+.stat-change.neutral { color: var(--text-tertiary); }
+.table-wrap { overflow-x: auto; border-radius: var(--radius-xl); border: 1px solid var(--border-light); background: var(--bg-card); }
+table { width: 100%; border-collapse: collapse; font-size: 15px; }
+thead tr { background: var(--bg-glass-dark); border-bottom: 1px solid var(--border-light); }
+th { padding: var(--space-md); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-secondary); text-align: left; white-space: nowrap; }
+td { padding: var(--space-md); border-bottom: 1px solid var(--border-light); color: var(--text-primary); vertical-align: middle; }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: var(--bg-glass-dark); }
+.field { margin-bottom: var(--space-md); }
+.field label { display: block; font-size: 13px; font-weight: 500; color: var(--text-secondary); margin-bottom: var(--space-sm); }
+.field input, .field select, .field textarea { width: 100%; padding: var(--space-md); background: var(--bg-glass-dark); border: 1px solid var(--border-light); border-radius: var(--radius-md); color: var(--text-primary); font-size: 16px; transition: all var(--duration-fast) var(--ease-out); outline: none; }
+.field input:focus, .field select:focus, .field textarea:focus { border-color: var(--ios-blue); box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.2); background: var(--bg-card); }
+.field select option { background: var(--bg-card); }
+.sidebar { position: fixed; left: 0; top: 0; bottom: 0; width: 280px; background: var(--bg-secondary); border-right: 1px solid var(--border-light); padding: var(--space-lg); z-index: 100; display: flex; flex-direction: column; overflow: hidden; }
+.sidebar.collapsed { width: 64px; }
+.sidebar-header { display: flex; align-items: center; gap: var(--space-md); padding-bottom: var(--space-lg); border-bottom: 1px solid var(--border-light); margin-bottom: var(--space-lg); flex-shrink: 0; }
+.logo-btn { display: flex; align-items: center; gap: 10px; cursor: pointer; background: none; border: none; padding: 0; text-decoration: none; flex: 1; min-width: 0; }
+.logo-mark { width: 44px; height: 44px; border-radius: var(--radius-md); background: var(--gradient-ios-1); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 18px; color: white; box-shadow: var(--shadow-glow-blue); }
+.logo-text { font-weight: 700; font-size: 17px; color: var(--text-primary); line-height: 1.2; opacity: 1; transition: opacity var(--duration-fast); white-space: nowrap; overflow: hidden; }
+.sidebar.collapsed .logo-text { opacity: 0; width: 0; }
+.sidebar-toggle { background: none; border: none; cursor: pointer; color: var(--text-secondary); padding: 6px; border-radius: var(--radius-md); transition: background var(--duration-fast); flex-shrink: 0; }
+.sidebar-toggle:hover { background: var(--bg-glass); color: var(--text-primary); }
+.sidebar.collapsed .sidebar-toggle svg { transform: rotate(180deg); }
+.sidebar-section { padding: 4px 0; flex: 1; overflow-y: auto; overflow-x: hidden; scroll-behavior: smooth; min-height: 0; }
+.sidebar-section::-webkit-scrollbar { width: 3px; }
+.sidebar-section::-webkit-scrollbar-track { background: transparent; }
+.sidebar-section::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 4px; }
+.sidebar-scroll-btn { width: 100%; border: none; background: rgba(255, 255, 255, 0.05); color: var(--text-tertiary); padding: 3px 0; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background var(--duration-fast), color var(--duration-fast); flex-shrink: 0; }
+.sidebar-scroll-btn:hover { background: var(--bg-glass); color: var(--text-primary); }
+.sidebar-scroll-btn svg { transition: transform 0.2s; }
+.sidebar-scroll-btn:active svg { transform: scale(0.85); }
+.sidebar.collapsed .sidebar-scroll-btn { opacity: 0; pointer-events: none; height: 0; padding: 0; overflow: hidden; }
+.sidebar-label { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.12em; color: var(--text-tertiary); padding: 6px 16px 2px; white-space: nowrap; overflow: hidden; }
+.sidebar.collapsed .sidebar-label { opacity: 0; }
+.nav-item { display: flex; align-items: center; gap: var(--space-md); padding: var(--space-md); border-radius: var(--radius-md); color: var(--text-secondary); text-decoration: none; margin: 4px 0; transition: all var(--duration-fast); position: relative; white-space: nowrap; overflow: hidden; }
+.nav-item:hover { background: var(--bg-glass); color: var(--text-primary); opacity: 1; }
+.nav-item.active { background: var(--ios-blue); color: white; }
+.nav-item.active::before { display: none; }
+.nav-icon { width: 20px; height: 20px; flex-shrink: 0; opacity: 0.7; }
+.nav-item.active .nav-icon, .nav-item:hover .nav-icon { opacity: 1; }
+.nav-label { transition: opacity var(--duration-fast); flex: 1; }
+.sidebar.collapsed .nav-label { opacity: 0; width: 0; overflow: hidden; }
+.nav-badge { background: var(--ios-blue); color: white; font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: var(--radius-full); min-width: 20px; text-align: center; transition: opacity var(--duration-fast); }
+.sidebar.collapsed .nav-badge { opacity: 0; }
+.sidebar-footer { padding: 12px 8px; border-top: 1px solid var(--border-light); flex-shrink: 0; }
+.notif-btn { position: relative; background: var(--bg-glass-dark); border: 1px solid var(--border-light); border-radius: var(--radius-md); padding: 7px 10px; cursor: pointer; color: var(--text-secondary); transition: all var(--duration-fast); }
+.notif-btn:hover { border-color: var(--ios-blue); color: var(--ios-blue); }
+.notif-dot { position: absolute; top: 5px; right: 5px; width: 8px; height: 8px; border-radius: 50%; background: var(--ios-orange); border: 2px solid var(--bg-card); }
+.user-chip { display: flex; align-items: center; gap: 8px; padding: 4px 12px 4px 4px; background: var(--bg-glass-dark); border: 1px solid var(--border-light); border-radius: var(--radius-full); cursor: pointer; transition: border-color var(--duration-fast); }
+.user-chip:hover { border-color: var(--ios-blue); }
+.user-avatar { width: 36px; height: 36px; border-radius: 50%; background: var(--gradient-ios-1); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; color: white; }
+.user-name { font-size: 13px; font-weight: 500; color: var(--text-secondary); }
+.quick-add { background: var(--ios-blue); border: none; border-radius: var(--radius-lg); color: white; font-size: 15px; font-weight: 600; padding: var(--space-md) var(--space-lg); cursor: pointer; display: flex; align-items: center; gap: 8px; box-shadow: 0 4px 16px rgba(0, 122, 255, 0.3); transition: all var(--duration-normal) var(--ease-out); }
+.quick-add:hover { background: var(--ios-blue-light); transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0, 122, 255, 0.4); }
+.theme-btn { display: flex; align-items: center; gap: 6px; padding: 7px 12px; border-radius: var(--radius-md); border: 1px solid var(--border-light); background: var(--bg-glass-dark); color: var(--text-secondary); cursor: pointer; transition: all var(--duration-fast); }
+.theme-btn:hover { border-color: var(--ios-blue); color: var(--ios-blue); background: var(--bg-glass); }
+.toast { position: fixed; bottom: 24px; right: 24px; z-index: 9999; background: var(--bg-card); border: 1px solid var(--border-light); border-radius: var(--radius-xl); padding: 14px 20px; box-shadow: var(--shadow-lg); font-size: 15px; color: var(--text-primary); display: none; animation: slideUp 0.3s ease; max-width: 320px; backdrop-filter: blur(40px); }
+.toast.show { display: flex; align-items: center; gap: 10px; }
+.toast-icon { font-size: 20px; }
+@keyframes slideUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+.login-shell { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--bg-primary); position: relative; overflow: hidden; }
+.login-box { width: 100%; max-width: 440px; position: relative; z-index: 1; background: var(--bg-card); border: 1px solid var(--border-light); border-radius: var(--radius-2xl); padding: var(--space-2xl); box-shadow: var(--shadow-lg); backdrop-filter: blur(40px); }
+.login-logo-mark { width: 72px; height: 72px; border-radius: var(--radius-xl); background: var(--gradient-ios-1); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 28px; color: white; box-shadow: var(--shadow-glow-blue); }
+.login-logo-text { font-weight: 700; font-size: 22px; color: var(--text-primary); }
+.login-logo-sub { font-size: 12px; color: var(--text-tertiary); font-weight: 400; margin-top: 2px; }
+.login-title { font-weight: 700; font-size: 28px; color: var(--text-primary); margin-bottom: var(--space-sm); }
+.login-sub { font-size: 15px; color: var(--text-secondary); margin-bottom: var(--space-2xl); }
+.login-error { background: rgba(255, 59, 48, 0.15); border: 1px solid rgba(255, 59, 48, 0.3); border-radius: var(--radius-md); padding: 12px 14px; color: var(--ios-red); font-size: 14px; margin-bottom: var(--space-lg); }
+.login-footer { margin-top: var(--space-xl); text-align: center; font-size: 12px; color: var(--text-tertiary); }
+.login-theme-toggle { position: absolute; top: 20px; right: 20px; }
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: var(--bg-primary); }
+::-webkit-scrollbar-thumb { background: var(--border-light); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-tertiary); }
+@media (max-width: 900px) {
+  .grid-4 { grid-template-columns: 1fr 1fr; }
+  .grid-3 { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 640px) {
+  .grid-2, .grid-3, .grid-4, .ios-grid-2, .ios-grid-3 { grid-template-columns: 1fr; }
+  .main-content, .ios-main { margin-left: 0 !important; }
+  .sidebar { transform: translateX(-100%); }
+}
+"""
+
+BASE_JS = """
+// Theme management
+(function(){
+  const stored = localStorage.getItem('jh_theme') || 'light';
+  document.documentElement.setAttribute('data-theme', stored);
+})();
+
+function toggleTheme(){
+  const cur = document.documentElement.getAttribute('data-theme');
+  const next = cur === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('jh_theme', next);
+  updateThemeBtn();
+}
+
+function updateThemeBtn(){
+  const theme = document.documentElement.getAttribute('data-theme');
+  const btn = document.getElementById('themeBtn');
+  if(!btn) return;
+  btn.innerHTML = theme === 'dark'
+    ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg> Light'
+    : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg> Dark';
+}
+
+// Initialize theme button on page load
+document.addEventListener('DOMContentLoaded', updateThemeBtn);
+// Also call it immediately in case DOMContentLoaded already fired
+setTimeout(updateThemeBtn, 0);
+
+// Sidebar collapse
+function toggleSidebar(){
+  const s = document.getElementById('sidebar');
+  if(s){ s.classList.toggle('collapsed'); localStorage.setItem('jh_sb', s.classList.contains('collapsed')?'1':'0'); }
+}
+(function(){
+  const s = document.getElementById('sidebar');
+  if(s && localStorage.getItem('jh_sb') === '1') s.classList.add('collapsed');
+})();
+
+// Sidebar scroll
+function sidebarScroll(delta){
+  const nav = document.getElementById('sidebarNav');
+  if(nav) nav.scrollBy({top: delta, behavior: 'smooth'});
+}
+
+// Toast
+function showToast(msg, icon){
+  let t = document.getElementById('globalToast');
+  if(!t){ t = document.createElement('div'); t.id='globalToast'; t.className='toast'; document.body.appendChild(t); }
+  t.innerHTML = `<span class="toast-icon">${icon||'✓'}</span>${msg}`;
+  t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 3200);
+}
+
+// Active nav
+(function(){
+  const links = document.querySelectorAll('.nav-item');
+  const path = window.location.pathname;
+  links.forEach(l => {
+    const href = l.getAttribute('href');
+    if(!href || href === '/' || href.includes('logout')) return;
+    if(path === href || path.startsWith(href + '/')) l.classList.add('active');
+  });
+})();
+"""
+
+
+def render_shell(content, title="JH Portal", sidebar_html="", topbar_title="", active_page=""):
+    _admin = current_admin()
+    _student = current_student()
+    if _admin:
+        logout_btn = '<a href="/logout" class="btn btn-danger btn-sm" style="display:inline-flex;align-items:center;gap:6px;text-decoration:none;padding:7px 14px;font-size:12.5px"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>Log Out</a>'
+    elif _student:
+        logout_btn = '<a href="/student-logout" class="btn btn-danger btn-sm" style="display:inline-flex;align-items:center;gap:6px;text-decoration:none;padding:7px 14px;font-size:12.5px"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>Log Out</a>'
+    else:
+        logout_btn = ""
+    return render_template_string("""<!DOCTYPE html>
+<html data-theme="light" lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} — JH Student Services</title>
+<style>{base_styles}</style>
+<script>(function(){{const t=localStorage.getItem('jh_theme')||'light';document.documentElement.setAttribute('data-theme',t);}})();</script>
+</head>
+<body>
+<div class="app-shell">
+  {sidebar_html}
+  <div class="main-content">
+    <div class="topbar">
+      <div class="topbar-logo">
+        <img src="/static/images/jh_logo.png"
+             alt="JH Skills Development"
+             style="width: 40px; height: auto; object-fit: contain;"
+             onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+        <div class="topbar-logo-fallback" style="display:none">JH</div>
+      </div>
+      <span class="topbar-title">{topbar_title}</span>
+      <div class="topbar-actions">
+        <div class="search-bar">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+          <input type="text" placeholder="Search...">
+        </div>
+        <button class="notif-btn" title="Notifications">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+          <span class="notif-dot"></span>
+        </button>
+        <button class="theme-btn" id="themeBtn" onclick="toggleTheme()"></button>
+        {logout_btn}
+      </div>
+    </div>
+    <div class="page">{content}</div>
+  </div>
+</div>
+<div class="toast" id="globalToast"></div>
+<script>{base_js}</script>
+</body>
+</html>""".format(
+        title=title,
+        base_styles=BASE_STYLES,
+        sidebar_html=sidebar_html,
+        topbar_title=topbar_title,
+        content=content,
+        logout_btn=logout_btn,
+        base_js=BASE_JS
+    ))
+
+
+def admin_sidebar(current_path=""):
+    admin = current_admin()
+    initials = "".join(w[0] for w in admin["name"].split()[:2]) if admin else "A"
+    links = [
+        ("/admin/dashboard", "🏠", "Dashboard", ""),
+        ("/learners", "👥", "Learners", ""),
+        ("/admin/interventions", "📚", "Programmes", ""),
+        ("/documents", "📁", "Documents", ""),
+        ("/clients", "🏢", "Clients", ""),
+        ("/admin/activity", "📊", "Activity", ""),
+        ("/admin/profile", "⚙️", "Settings", ""),
+        ("/admin/messages", "💬", "Messages", ""),
+    ]
+    nav_items = ""
+    for href, icon, label, badge in links:
+        active = "active" if current_path == href else ""
+        b = f'<span class="nav-badge">{badge}</span>' if badge else ""
+        nav_items += f'<a class="nav-item {active}" href="{href}"><span class="nav-icon">{icon}</span><span class="nav-label">{label}</span>{b}</a>\n'
+    return f"""
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <a href="/admin/dashboard" class="logo-btn">
+      <img src="/static/images/jh_logo.png" alt="JH Logo" class="logo-mark" style="background:transparent;width:32px;height:32px;object-fit:contain;">
+      <div class="logo-text">JH Student<br>Services</div>
+    </a>
+    <button class="sidebar-toggle" onclick="toggleSidebar()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
+  </div>
+  <button class="sidebar-scroll-btn" onclick="sidebarScroll(-80)" title="Scroll up">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15"/></svg>
+  </button>
+  <div class="sidebar-section" id="sidebarNav">
+    <div class="sidebar-label">Main Menu</div>
+    {nav_items}
+  </div>
+  <button class="sidebar-scroll-btn" onclick="sidebarScroll(80)" title="Scroll down">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+  </button>
+  <div class="sidebar-footer">
+    <div class="nav-item" style="margin:0;border-radius:8px;background:rgba(255,255,255,.04)">
+      <div class="user-avatar" style="width:30px;height:30px;font-size:11px">{initials}</div>
+      <div class="nav-label" style="opacity:1">
+        <div style="color:#fff;font-size:12px;font-weight:600">{admin['name'] if admin else 'Admin'}</div>
+        <div style="color:rgba(255,255,255,.35);font-size:10px">{admin['role_label'] if admin else ''}</div>
+      </div>
+    </div>
+
+  </div>
+</aside>"""
+
+
+def student_sidebar(current_path=""):
+    student = current_student()
+    initials = "".join(w[0] for w in student["full_name"].split()[:2]) if student else "S"
+    links = [
+        ("/student/dashboard", "🏠", "Dashboard", ""),
+        ("/student/profile", "👤", "My Profile", ""),
+        ("/student/timetable", "📅", "Schedule", ""),
+        ("/student/tasks", "✅", "Tasks", str(len(STUDENT_TASKS))),
+        ("/student/results", "📝", "Assessments", ""),
+        ("/student/registration", "📋", "Registration", ""),
+        ("/student/lms", "💻", "LMS", ""),
+        ("/student/fees", "💰", "Fees", ""),
+        ("/student/records", "📂", "Records", ""),
+        ("/student/services", "🏫", "Services", ""),
+        ("/student/support", "🤝", "Support", ""),
+        ("/student/notes", "📒", "Notes", str(len(STUDENT_NOTES))),
+        ("/student/announcements", "📢", "Notices", str(len(ANNOUNCEMENTS))),
+        ("/student/messages", "💬", "Messages", ""),
+    ]
+    nav_items = ""
+    for href, icon, label, badge in links:
+        active = "active" if current_path == href else ""
+        b = f'<span class="nav-badge">{badge}</span>' if badge else ""
+        nav_items += f'<a class="nav-item {active}" href="{href}"><span class="nav-icon">{icon}</span><span class="nav-label">{label}</span>{b}</a>\n'
+    return f"""
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <a href="/student/dashboard" class="logo-btn">
+      <img src="/static/images/jh_logo.png" alt="JH Logo" class="logo-mark" style="background:transparent;width:32px;height:32px;object-fit:contain;">
+      <div class="logo-text">Learner<br>Portal</div>
+    </a>
+    <button class="sidebar-toggle" onclick="toggleSidebar()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
+  </div>
+  <button class="sidebar-scroll-btn" onclick="sidebarScroll(-80)" title="Scroll up">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15"/></svg>
+  </button>
+  <div class="sidebar-section" id="sidebarNav">
+    <div class="sidebar-label">Navigation</div>
+    {nav_items}
+  </div>
+  <button class="sidebar-scroll-btn" onclick="sidebarScroll(80)" title="Scroll down">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+  </button>
+  <div class="sidebar-footer">
+    <div class="nav-item" style="margin:0;border-radius:8px;background:rgba(255,255,255,.04)">
+      <div class="user-avatar" style="width:30px;height:30px;font-size:11px">{initials}</div>
+      <div class="nav-label" style="opacity:1">
+        <div style="color:#fff;font-size:12px;font-weight:600">{student['full_name'] if student else 'Learner'}</div>
+        <div style="color:rgba(255,255,255,.35);font-size:10px">{student['student_number'] if student else ''}</div>
+      </div>
+    </div>
+
+  </div>
+</aside>"""
+
+
+def receptionist_sidebar(current_path=""):
+    admin = current_receptionist()
+    initials = "".join(w[0] for w in admin["name"].split()[:2]) if admin else "R"
+    links = [
+        ("/receptionist/dashboard", "🏠", "Dashboard", ""),
+        ("/receptionist/learners", "👥", "Learner Management", ""),
+        ("/receptionist/documents", "📂", "Document Sharing", ""),
+        ("/receptionist/attendance", "📋", "Attendance", ""),
+        ("/receptionist/reports", "📊", "Reports", ""),
+        ("/receptionist/announcements", "📢", "Announcements", str(len(ANNOUNCEMENTS))),
+        ("/receptionist/messages", "💬", "Messages", ""),
+    ]
+    nav_items = ""
+    for href, icon, label, badge in links:
+        active = "active" if current_path == href else ""
+        b = f'<span class="nav-badge">{badge}</span>' if badge else ""
+        nav_items += f'<a class="nav-item {active}" href="{href}"><span class="nav-icon">{icon}</span><span class="nav-label">{label}</span>{b}</a>\n'
+    return f"""
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <a href="/receptionist/dashboard" class="logo-btn">
+      <img src="/static/images/jh_logo.png" alt="JH Logo" class="logo-mark" style="background:transparent;width:32px;height:32px;object-fit:contain;">
+      <div class="logo-text">Reception<br>Desk</div>
+    </a>
+    <button class="sidebar-toggle" onclick="toggleSidebar()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
+  </div>
+  <button class="sidebar-scroll-btn" onclick="sidebarScroll(-80)" title="Scroll up">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15"/></svg>
+  </button>
+  <div class="sidebar-section" id="sidebarNav">
+    <div class="sidebar-label">Operations</div>
+    {nav_items}
+  </div>
+  <button class="sidebar-scroll-btn" onclick="sidebarScroll(80)" title="Scroll down">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+  </button>
+  <div class="sidebar-footer">
+    <div class="nav-item" style="margin:0;border-radius:8px;background:rgba(255,255,255,.04)">
+      <div class="user-avatar" style="width:30px;height:30px;font-size:11px">{initials}</div>
+      <div class="nav-label" style="opacity:1">
+        <div style="color:#fff;font-size:12px;font-weight:600">{admin['name'] if admin else 'Receptionist'}</div>
+        <div style="color:rgba(255,255,255,.35);font-size:10px">{admin['role_label'] if admin else ''}</div>
+      </div>
+    </div>
+
+  </div>
+</aside>"""
+
+
+def client_sidebar(current_path=""):
+    admin = current_client()
+    initials = "".join(w[0] for w in admin["name"].split()[:2]) if admin else "C"
+    links = [
+        ("/client/dashboard", "🏠", "Dashboard", ""),
+        ("/client/learners", "👥", "Sponsored Learners", ""),
+        ("/client/reports", "📊", "Performance Reports", ""),
+        ("/client/certificates", "🎓", "Certificates", ""),
+        ("/client/announcements", "📢", "Notices", str(len(ANNOUNCEMENTS))),
+        ("/client/messages", "💬", "Messages", ""),
+    ]
+    nav_items = ""
+    for href, icon, label, badge in links:
+        active = "active" if current_path == href else ""
+        b = f'<span class="nav-badge">{badge}</span>' if badge else ""
+        nav_items += f'<a class="nav-item {active}" href="{href}"><span class="nav-icon">{icon}</span><span class="nav-label">{label}</span>{b}</a>\n'
+    return f"""
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <a href="/client/dashboard" class="logo-btn">
+      <img src="/static/images/jh_logo.png" alt="JH Logo" class="logo-mark" style="background:transparent;width:32px;height:32px;object-fit:contain;">
+      <div class="logo-text">Client<br>Portal</div>
+    </a>
+    <button class="sidebar-toggle" onclick="toggleSidebar()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
+  </div>
+  <button class="sidebar-scroll-btn" onclick="sidebarScroll(-80)" title="Scroll up">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15"/></svg>
+  </button>
+  <div class="sidebar-section" id="sidebarNav">
+    <div class="sidebar-label">Client Menu</div>
+    {nav_items}
+  </div>
+  <button class="sidebar-scroll-btn" onclick="sidebarScroll(80)" title="Scroll down">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+  </button>
+  <div class="sidebar-footer">
+    <div class="nav-item" style="margin:0;border-radius:8px;background:rgba(255,255,255,.04)">
+      <div class="user-avatar" style="width:30px;height:30px;font-size:11px">{initials}</div>
+      <div class="nav-label" style="opacity:1">
+        <div style="color:#fff;font-size:12px;font-weight:600">{admin['name'] if admin else 'Client'}</div>
+        <div style="color:rgba(255,255,255,.35);font-size:10px">{admin['role_label'] if admin else ''}</div>
+      </div>
+    </div>
+
+  </div>
+</aside>"""
+
+
+# ── Login (unified) ──────────────────────────────────────────────────────────
+@app.route("/", methods=["GET", "POST"])
+def login():
+    if current_admin(): return redirect(url_for("admin_dashboard"))
+    if current_receptionist(): return redirect(url_for("receptionist_dashboard"))
+    if current_client(): return redirect(url_for("client_dashboard"))
+    if current_student(): return redirect(url_for("student_dashboard"))
+
+    error = None
+    if request.method == "POST":
+        identifier = request.form.get("identifier", "").strip()
+        password = request.form.get("password", "").strip()
+        email_lower = identifier.lower()
+
+        # Check admin/receptionist
+        admin = ADMIN_USERS.get(email_lower)
+        if admin and admin["password"] == password:
+            session.clear()
+            session["admin_logged_in"] = True
+            session["admin_email"] = email_lower
+            return redirect(url_for(admin["default_route"]))
+
+        # Check student
+        student = get_student_by_username(identifier)
+        if student and student["password"] == password:
+            if student.get("status") not in ("Active", "Inactive"):
+                error = "Your account is pending admin approval. You will receive an email once approved."
+            else:
+                session.clear()
+                session["student_logged_in"] = True
+                session["student_id"] = student["id"]
+                return redirect(url_for("student_dashboard"))
+
+        error = "Invalid credentials. Please check your email/username and password."
+
+    page = render_template_string(f"""
+<!DOCTYPE html>
+<html data-theme="light" lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign In — JH Skills Development & Consultancy</title>
+<style>{BASE_STYLES}
+
+body {{
+  min-height: 100vh;
+  background: var(--gradient-hero);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}}
+
+.login-shell {{
+  display: flex;
+  width: 100%;
+  max-width: 1000px;
+  gap: 40px;
+  align-items: center;
+}}
+
+/* Left panel — brand hero */
+.login-hero {{
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}}
+
+.hero-logo-wrap {{
+  text-align: center;
+}}
+
+.hero-logo-img {{
+  width: 200px;
+  height: auto;
+  margin-bottom: 20px;
+}}
+
+.hero-title {{
+  font-weight: 800;
+  font-size: 36px;
+  color: var(--text-primary);
+  line-height: 1.2;
+  text-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}}
+
+/* Right panel — form */
+.login-form-panel {{
+  width: 400px;
+  background: var(--bg-card);
+  backdrop-filter: blur(20px);
+  border-radius: 32px;
+  padding: 48px 40px;
+  border: 1px solid var(--border-light);
+  box-shadow: 0 20px 60px rgba(0,0,0,0.15);
+}}
+
+.login-theme-toggle {{
+  position: absolute;
+  top: 20px;
+  right: 20px;
+}}
+
+.login-form-header {{
+  margin-bottom: 32px;
+}}
+
+.login-title {{
+  font-weight: 800;
+  font-size: 28px;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+}}
+
+.login-sub {{
+  font-size: 14px;
+  color: var(--text-secondary);
+}}
+
+.login-error {{
+  background: rgba(255,107,107,.2);
+  border: 1px solid rgba(255,107,107,.3);
+  border-radius: 12px;
+  padding: 12px;
+  color: #B91C1C;
+  font-size: 13px;
+  margin-bottom: 20px;
+}}
+
+/* Fields */
+.field {{
+  margin-bottom: 20px;
+}}
+
+.field label {{
+  display: none;
+}}
+
+.field input, .field select {{
+  width: 100%;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-light);
+  border-radius: 16px;
+  padding: 16px 20px;
+  color: var(--text-primary);
+  font-size: 16px;
+  outline: none;
+  transition: transform .2s, box-shadow .2s;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+}}
+
+.field input::placeholder {{
+  color: var(--text-tertiary);
+}}
+
+.field input:focus {{
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.1);
+}}
+
+.field input::placeholder, .field select::placeholder {{
+  color: var(--text-tertiary);
+}}
+
+/* Buttons */
+.btn-jh-primary {{
+  width: 100%;
+  background: var(--jh-primary);
+  border: none;
+  border-radius: 20px;
+  padding: 16px 24px;
+  color: #fff;
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+  letter-spacing: .02em;
+  transition: all .2s;
+  box-shadow: 0 8px 20px rgba(16, 185, 129, 0.3);
+  margin-top: 10px;
+}}
+
+.btn-jh-primary:hover {{
+  background: var(--jh-primary-light);
+  transform: translateY(-2px);
+  box-shadow: 0 12px 28px rgba(16, 185, 129, 0.4);
+}}
+
+.btn-jh-secondary {{
+  width: 100%;
+  background: transparent;
+  border: none;
+  padding: 12px;
+  color: var(--text-primary);
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all .2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  text-decoration: none;
+  margin-top: 10px;
+}}
+
+.btn-jh-secondary:hover {{
+  color: var(--jh-primary);
+}}
+
+.login-divider {{
+  display: none;
+}}
+
+@media (max-width: 820px) {{
+  .login-hero {{ display: none; }}
+  .login-form-panel {{ width: 100%; max-width: 400px; }}
+}}
+</style>
+<script>(function(){{const t=localStorage.getItem('jh_theme')||'light';document.documentElement.setAttribute('data-theme',t);}})();</script>
+</head>
+<body>
+<div class="login-shell">
+
+  <!-- Left: Brand Hero -->
+  <div class="login-hero">
+    <div class="hero-logo-wrap">
+      <img class="hero-logo-img"
+           src="/static/images/jh_logo.png"
+           alt="JH Skills Development and Consultancy"
+           onerror="this.style.display='none'">
+      <div class="hero-title">JH Skills Development<br>& Consultancy</div>
+    </div>
+  </div>
+
+  <!-- Right: Form Panel -->
+  <div class="login-form-panel">
+    <button class="theme-btn login-theme-toggle" id="themeBtn" onclick="toggleTheme()"></button>
+
+    <div class="login-form-header">
+      <h2 class="login-title">Login</h2>
+    </div>
+
+    {'<div class="login-error">⚠️ ' + error + '</div>' if error else ''}
+
+    <form method="POST">
+      <div class="field">
+        <select name="user_type">
+          <option value="admin">Admin</option>
+          <option value="student">Student</option>
+        </select>
+      </div>
+      <div class="field">
+        <input name="identifier" type="text" placeholder="Username" required autofocus>
+      </div>
+      <div class="field">
+        <input name="password" type="password" placeholder="Password" required>
+      </div>
+      <button class="btn-jh-primary" type="submit">Login</button>
+    </form>
+
+    <a href="/student/signup" class="btn-jh-secondary">
+      Register
+    </a>
+  </div>
+
+</div>
+<script>{BASE_JS}</script>
+</body>
+</html>
+""")
+    return page
+
+
+@app.after_request
+def no_cache_for_protected(response):
+    if request.path.startswith('/student/') or request.path.startswith('/admin/') or request.path.startswith('/receptionist/') or request.path.startswith('/client/'):
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, private'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+    return response
+
+@app.route("/logout", methods=["GET", "POST"])
+def logout():
+    session.pop("admin_logged_in", None)
+    session.pop("admin_email", None)
+    session.clear()
+    return redirect(url_for("login"))
+
+@app.route("/student-logout", methods=["GET", "POST"])
+def student_logout():
+    session.pop("student_logged_in", None)
+    session.pop("student_id", None)
+    session.clear()
+    response = redirect(url_for("login"))
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
+# ── Student self-registration ─────────────────────────────────────────────────
+@app.route("/student/signup", methods=["GET", "POST"])
+def student_signup():
+    if current_student(): return redirect(url_for("student_dashboard"))
+    if current_admin(): return redirect(url_for("admin_dashboard"))
+
+    error = None
+    success = None
+    pending_id = None
+
+    if request.method == "POST":
+        full_name = request.form.get("full_name", "").strip()
+        email     = request.form.get("email", "").strip()
+        phone     = request.form.get("phone", "").strip()
+        id_number = request.form.get("id_number", "").strip()
+        gender    = request.form.get("gender", "").strip()
+        address   = request.form.get("address", "").strip()
+        programme = request.form.get("programme", "").strip()
+        password  = request.form.get("password", "").strip()
+        confirm_password = request.form.get("confirm_password", "").strip()
+
+        if not all([full_name, email, phone, id_number, gender, address, programme, password]):
+            error = "Please fill in all required fields."
+        elif password != confirm_password:
+            error = "Passwords do not match."
+        elif len(password) < 6:
+            error = "Password must be at least 6 characters."
+        else:
+            students = load_students()
+            pending  = load_pending()
+            existing_students = [s for s in students if s.get("email","").lower() == email.lower() or s.get("id_number","") == id_number]
+            existing_pending  = [p for p in pending  if p.get("email","").lower() == email.lower() or p.get("id_number","") == id_number]
+            if existing_students or existing_pending:
+                error = "An account with this email or ID number already exists."
+            else:
+                # Auto-approve: create Active student account immediately, no admin approval needed
+                n          = 1000 + len(students) + 1
+                sid        = str(n)
+                first_name = full_name.split()[0].lower()
+                username   = f"learner.jh-{sid}"
+                new_student = {
+                    "id": sid, "student_number": f"2026{sid}", "full_name": full_name,
+                    "email": email, "phone": phone, "id_number": id_number,
+                    "gender": gender, "address": address, "employment": "Unemployed",
+                    "qualification": programme, "faculty": "Pending Assignment",
+                    "programme": programme, "coordinator": "Pending Assignment",
+                    "location": "Pending Assignment", "start_date": datetime.now().strftime("%Y-%m-%d"),
+                    "status": "Active", "username": username, "password": password,
+                    "campus": "Pending Assignment", "year_level": "Year 1",
+                    "emergency_contact_name": "", "emergency_contact_phone": "",
+                    "emergency_contact_relationship": "",
+                    "modules": [], "tuition_balance": "R0",
+                    "bursary_status": "Pending", "registration_status": "Registered",
+                    "lms_link": "https://canvas.instructure.com/",
+                    "portal_email": f"{first_name}.{sid}@student.jh.co.za",
+                }
+                students.insert(0, new_student)
+                save_students(students)
+                # Log the student in straight away
+                session.clear()
+                session["student_logged_in"] = True
+                session["student_id"] = sid
+                return redirect(url_for("student_dashboard"))
+
+    PROGRAMMES = [
+        "Diploma in Information Technology",
+        "Business Administration NQF 4",
+        "National Certificate: IT: Systems Development NQF 5",
+        "Further Education and Training Certificate: Business Administration NQF 4",
+        "National Certificate: New Venture Creation NQF 2",
+        "Skills Programme: Project Management",
+        "Learnerships: Generic Management NQF 5",
+        "Other / Not Listed",
+    ]
+
+    if success == "pending_no_email":
+        page = render_template_string(f"""
+<!DOCTYPE html>
+<html data-theme="light" lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Registration Submitted — JH Portal</title>
+<style>{BASE_STYLES}
+body{{background:var(--bg);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:40px 20px}}
+.done-card{{max-width:480px;width:100%;background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:44px 36px;text-align:center;box-shadow:0 8px 40px rgba(45,106,79,.12)}}
+</style>
+</head>
+<body>
+<div class="done-card">
+  <div style="font-size:64px;margin-bottom:16px">🎉</div>
+  <h1 style="font-family:'Syne',sans-serif;font-size:24px;margin-bottom:10px">Registration Submitted!</h1>
+  <p style="color:var(--text-2);font-size:14px;line-height:1.7;margin-bottom:28px">
+    Your application has been received and is awaiting admin approval.<br>
+    You will be contacted once your account has been activated.
+  </p>
+  <a href="/" style="display:inline-block;background:var(--jh-grad);color:#fff;text-decoration:none;padding:13px 32px;border-radius:10px;font-weight:700;font-family:'Syne',sans-serif;font-size:15px">← Back to Sign In</a>
+</div>
+</body>
+</html>
+""")
+        return page
+
+    if success == "submitted":
+        # Show verification UI
+        page = render_template_string(f"""
+<!DOCTYPE html>
+<html data-theme="light" lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Verify Your Details — JH Portal</title>
+<style>{BASE_STYLES}
+body{{background:var(--bg);min-height:100vh}}
+.vbox{{max-width:480px;margin:60px auto;padding:20px}}
+.vcard{{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:36px;box-shadow:0 4px 32px rgba(0,0,0,.07)}}
+.vstep{{display:flex;align-items:center;gap:10px;margin-bottom:24px;font-size:13.5px;color:var(--text-2)}}
+.vstep-num{{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px;flex-shrink:0}}
+.vstep-num.done{{background:rgba(34,197,94,.15);color:#16a34a}}
+.vstep-num.active{{background:var(--jh-teal);color:#fff}}
+.vstep-num.wait{{background:var(--bg-2);color:var(--text-3)}}
+.otp-inputs{{display:flex;gap:8px;justify-content:center;margin:18px 0}}
+.otp-inputs input{{width:44px;height:52px;border-radius:10px;border:1.5px solid var(--border);background:var(--bg-2);color:var(--text);font-size:22px;font-weight:700;text-align:center;font-family:'Syne',sans-serif;outline:none}}
+.otp-inputs input:focus{{border-color:var(--jh-teal);box-shadow:0 0 0 3px rgba(0,168,157,.12)}}
+.vbtn{{width:100%;background:var(--jh-grad);border:none;border-radius:8px;padding:13px;color:#fff;font-size:15px;font-weight:700;font-family:'Syne',sans-serif;cursor:pointer;margin-top:8px;transition:opacity .2s}}
+.vbtn:hover{{opacity:.9}}
+.vmsg{{font-size:13px;margin-top:12px;min-height:20px;text-align:center}}
+.vmsg.err{{color:#e05555}}.vmsg.ok{{color:#16a34a}}
+</style>
+<script>(function(){{const t=localStorage.getItem('jh_theme')||'light';document.documentElement.setAttribute('data-theme',t);}})();</script>
+</head>
+<body>
+<div class="vbox">
+  <div style="text-align:center;margin-bottom:28px">
+    <img src="/static/images/jh_logo.png" style="height:40px;object-fit:contain;" onerror="this.style.display='none'">
+    <h1 style="font-family:'Syne',sans-serif;font-size:22px;margin:12px 0 4px">Almost there!</h1>
+    <p style="color:var(--text-2);font-size:14px">Verify your email and mobile number to complete registration</p>
+  </div>
+
+  <div class="vcard" id="emailCard">
+    <div class="vstep"><div class="vstep-num active" id="step1num">1</div><div><strong>Verify your email</strong><br><span style="font-size:12px;color:var(--text-3)">Check your inbox for a verification link</span></div></div>
+    <div style="background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-size:13.5px;text-align:center;margin-bottom:16px">
+      📧 We sent a link to <strong>your email</strong>.<br>Click it to verify, then come back here.
+    </div>
+    <div id="emailWait" style="text-align:center;color:var(--text-3);font-size:13px">Waiting for email verification…</div>
+    <button class="vbtn" style="background:var(--bg-2);color:var(--text-2);border:1px solid var(--border);margin-top:14px" onclick="checkEmailStatus()">
+      ✅ I've verified my email
+    </button>
+    <div style="text-align:center;margin-top:10px">
+      <a href="#" onclick="resendEmail()" style="font-size:12px;color:var(--jh-teal)">Resend verification email</a>
+    </div>
+    <div class="vmsg" id="emailMsg"></div>
+  </div>
+
+  <div class="vcard" id="otpCard" style="display:none;margin-top:20px">
+    <div class="vstep"><div class="vstep-num active" id="step2num">2</div><div><strong>Verify your mobile number</strong><br><span style="font-size:12px;color:var(--text-3)">Enter the 6-digit OTP sent to your phone</span></div></div>
+    <div class="otp-inputs" id="otpInputs">
+      <input type="text" maxlength="1" oninput="otpNext(this,0)" onkeydown="otpBack(event,0)">
+      <input type="text" maxlength="1" oninput="otpNext(this,1)" onkeydown="otpBack(event,1)">
+      <input type="text" maxlength="1" oninput="otpNext(this,2)" onkeydown="otpBack(event,2)">
+      <input type="text" maxlength="1" oninput="otpNext(this,3)" onkeydown="otpBack(event,3)">
+      <input type="text" maxlength="1" oninput="otpNext(this,4)" onkeydown="otpBack(event,4)">
+      <input type="text" maxlength="1" oninput="otpNext(this,5)" onkeydown="otpBack(event,5)">
+    </div>
+    <button class="vbtn" onclick="submitOtp()">Verify OTP →</button>
+    <div style="text-align:center;margin-top:10px">
+      <a href="#" onclick="resendOtp()" style="font-size:12px;color:var(--jh-teal)">Resend OTP</a>
+    </div>
+    <div class="vmsg" id="otpMsg"></div>
+  </div>
+
+  <div id="doneCard" style="display:none;margin-top:20px">
+    <div class="vcard" style="text-align:center">
+      <div style="font-size:56px;margin-bottom:12px">🎉</div>
+      <h2 style="font-family:'Syne',sans-serif;font-size:20px;margin-bottom:8px">Verification Complete!</h2>
+      <p style="color:var(--text-2);font-size:14px;line-height:1.6">Your registration is now awaiting admin approval.<br>You'll receive an email with your login details once approved.</p>
+      <a href="/" style="display:inline-block;margin-top:20px;background:var(--jh-grad);color:#fff;text-decoration:none;padding:12px 28px;border-radius:8px;font-weight:700;font-family:'Syne',sans-serif">← Back to Sign In</a>
+    </div>
+  </div>
+</div>
+<script>
+const PENDING_ID = '{pending_id}';
+const otpEls = Array.from(document.querySelectorAll('#otpInputs input'));
+
+function otpNext(el, idx) {{
+  el.value = el.value.replace(/\\D/g,'');
+  if (el.value && idx < 5) otpEls[idx+1].focus();
+}}
+function otpBack(e, idx) {{
+  if (e.key === 'Backspace' && !otpEls[idx].value && idx > 0) otpEls[idx-1].focus();
+}}
+
+async function checkEmailStatus() {{
+  const res = await fetch('/api/verify/email-status', {{
+    method:'POST', headers:{{'Content-Type':'application/json'}},
+    body: JSON.stringify({{id: PENDING_ID}})
+  }});
+  const d = await res.json();
+  const msg = document.getElementById('emailMsg');
+  if (d.verified) {{
+    msg.className = 'vmsg ok'; msg.textContent = '✅ Email verified!';
+    document.getElementById('step1num').className = 'vstep-num done';
+    document.getElementById('step1num').textContent = '✓';
+    setTimeout(() => {{
+      document.getElementById('otpCard').style.display = 'block';
+      otpEls[0].focus();
+    }}, 600);
+  }} else {{
+    msg.className = 'vmsg err'; msg.textContent = 'Not verified yet — please click the link in your email.';
+  }}
+}}
+
+async function resendEmail() {{
+  const res = await fetch('/api/verify/resend-email', {{
+    method:'POST', headers:{{'Content-Type':'application/json'}},
+    body: JSON.stringify({{id: PENDING_ID}})
+  }});
+  const d = await res.json();
+  const msg = document.getElementById('emailMsg');
+  msg.className = 'vmsg ok'; msg.textContent = d.message || 'Resent!';
+}}
+
+async function submitOtp() {{
+  const otp = otpEls.map(e => e.value).join('');
+  if (otp.length !== 6) {{ document.getElementById('otpMsg').className='vmsg err'; document.getElementById('otpMsg').textContent='Enter all 6 digits.'; return; }}
+  const res = await fetch('/api/verify/otp', {{
+    method:'POST', headers:{{'Content-Type':'application/json'}},
+    body: JSON.stringify({{id: PENDING_ID, otp}})
+  }});
+  const d = await res.json();
+  const msg = document.getElementById('otpMsg');
+  if (d.ok) {{
+    msg.className='vmsg ok'; msg.textContent='✅ Phone verified!';
+    setTimeout(() => {{
+      document.getElementById('emailCard').style.display='none';
+      document.getElementById('otpCard').style.display='none';
+      document.getElementById('doneCard').style.display='block';
+    }}, 800);
+  }} else {{
+    msg.className='vmsg err'; msg.textContent = d.error || 'Invalid OTP.';
+    otpEls.forEach(e => e.value=''); otpEls[0].focus();
+  }}
+}}
+
+async function resendOtp() {{
+  const res = await fetch('/api/verify/resend-otp', {{
+    method:'POST', headers:{{'Content-Type':'application/json'}},
+    body: JSON.stringify({{id: PENDING_ID}})
+  }});
+  const d = await res.json();
+  const msg = document.getElementById('otpMsg');
+  msg.className='vmsg ok'; msg.textContent = d.message || 'OTP resent!';
+}}
+</script>
+</body>
+</html>
+""")
+        return page
+
+    page = render_template_string(f"""
+<!DOCTYPE html>
+<html data-theme="light" lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Student Registration — JH Skills Development & Consultancy</title>
+<style>{BASE_STYLES}
+
+body {{ background: var(--bg); min-height: 100vh; }}
+
+.signup-shell {{
+  min-height: 100vh;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 20px;
+}}
+
+.signup-box {{
+  width: 100%;
+  max-width: 600px;
+}}
+
+.signup-header {{
+  text-align: center;
+  margin-bottom: 32px;
+}}
+
+.signup-logo {{
+  width: 60px;
+  height: auto;
+  margin-bottom: 16px;
+}}
+
+.signup-title {{
+  font-family: 'Syne', sans-serif;
+  font-weight: 800;
+  font-size: 26px;
+  color: var(--text);
+  margin-bottom: 6px;
+}}
+
+.signup-sub {{
+  font-size: 14px;
+  color: var(--text-2);
+}}
+
+.signup-card {{
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 36px;
+  box-shadow: 0 4px 32px rgba(0,0,0,.07);
+}}
+
+.field {{ margin-bottom: 18px; }}
+
+.field label {{
+  display: block;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin-bottom: 6px;
+}}
+
+.field input, .field select {{
+  width: 100%;
+  background: var(--bg-2);
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  padding: 11px 14px;
+  color: var(--text);
+  font-size: 14px;
+  font-family: 'DM Sans', sans-serif;
+  outline: none;
+  transition: border-color .2s, box-shadow .2s;
+}}
+
+.field input:focus, .field select:focus {{
+  border-color: var(--jh-teal);
+  box-shadow: 0 0 0 3px rgba(0,168,157,0.12);
+}}
+
+.field-row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
+
+.signup-error {{
+  background: rgba(255,107,107,.08);
+  border: 1px solid rgba(255,107,107,.2);
+  border-radius: 8px;
+  padding: 12px 14px;
+  color: #e05555;
+  font-size: 13px;
+  margin-bottom: 20px;
+}}
+
+.section-divider {{
+  font-family: 'Syne', sans-serif;
+  font-weight: 700;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .1em;
+  color: var(--text-3);
+  margin: 24px 0 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}}
+
+.section-divider::after {{
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}}
+
+.btn-jh-primary {{
+  width: 100%;
+  background: var(--jh-grad);
+  border: none;
+  border-radius: 8px;
+  padding: 13px 20px;
+  color: #fff;
+  font-size: 15px;
+  font-weight: 700;
+  font-family: 'Syne', sans-serif;
+  cursor: pointer;
+  box-shadow: 0 4px 18px rgba(0,168,157,0.28);
+  transition: opacity .2s, transform .15s;
+  margin-top: 8px;
+}}
+
+.btn-jh-primary:hover {{ opacity: .92; transform: translateY(-1px); }}
+
+.back-link {{
+  text-align: center;
+  margin-top: 20px;
+  font-size: 13px;
+  color: var(--text-3);
+}}
+
+.back-link a {{ color: var(--jh-teal); font-weight: 600; }}
+
+@media (max-width: 560px) {{
+  .field-row {{ grid-template-columns: 1fr; }}
+  .signup-card {{ padding: 24px 20px; }}
+}}
+</style>
+<script>(function(){{const t=localStorage.getItem('jh_theme')||'light';document.documentElement.setAttribute('data-theme',t);}})();</script>
+</head>
+<body>
+<div class="signup-shell">
+  <div class="signup-box">
+    <div class="signup-header">
+      <img class="signup-logo"
+           src="/static/images/jh_logo.png"
+           alt="JH Skills Development"
+           onerror="this.style.display='none'">
+      <h1 class="signup-title">Student Registration</h1>
+      <p class="signup-sub">Create your learner account to access the JH portal</p>
+    </div>
+
+    <div class="signup-card">
+      {'<div class="signup-error">⚠️ ' + error + '</div>' if error else ''}
+
+      <form method="POST">
+
+      <div class="section-divider">Personal Information</div>
+      <div class="field"><label>Full Name *</label><input name="full_name" type="text" placeholder="e.g. Thabo Mokoena" required></div>
+      <div class="field-row">
+        <div class="field"><label>Email Address *</label><input name="email" type="email" placeholder="your@email.com" required></div>
+        <div class="field"><label>Phone Number *</label><input name="phone" type="tel" placeholder="e.g. +27 71 234 5678" required></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>ID Number *</label><input name="id_number" type="text" placeholder="13-digit SA ID number" required></div>
+        <div class="field"><label>Gender *</label><select name="gender" required><option value="">Select gender</option><option>Male</option><option>Female</option><option>Non-binary</option><option>Prefer not to say</option></select></div>
+      </div>
+      <div class="field"><label>Residential Address *</label><input name="address" type="text" placeholder="e.g. Johannesburg, Gauteng" required></div>
+
+      <div class="section-divider">Programme Selection</div>
+      <div class="field"><label>Programme / Course *</label><select name="programme" required><option value="">Select a programme</option>{"".join(f"<option>{p}</option>" for p in PROGRAMMES)}</select></div>
+
+      <div class="section-divider">Set Your Password</div>
+      <div class="field-row">
+        <div class="field"><label>Password *</label><input name="password" type="password" placeholder="Min. 6 characters" required></div>
+        <div class="field"><label>Confirm Password *</label><input name="confirm_password" type="password" placeholder="Repeat password" required></div>
+      </div>
+
+      <button class="btn-jh-primary" type="submit">Submit Registration →</button>
+      </form>
+
+      <div class="back-link"><a href="/">← Already have an account? Sign in</a></div>
+    </div>
+  </div>
+</div>
+<script>{BASE_JS}</script>
+</body>
+</html>
+""")
+    return page
+
+
+# ── Email-link verification ───────────────────────────────────────────────────
+@app.route("/verify-email")
+def verify_email():
+    pid   = request.args.get("id", "")
+    token = request.args.get("token", "")
+    ok    = verify_email_token(pid, token)
+    if ok:
+        pending = load_pending()
+        for p in pending:
+            if p["id"] == pid:
+                p["email_verified"] = True
+                break
+        save_pending(pending)
+        msg = "✅ Email verified successfully! Go back to the registration page and click <strong>'I've verified my email'</strong> to continue."
+        colour = "#2D6A4F"
+    else:
+        msg = "⚠️ This verification link is invalid or has already been used."
+        colour = "#e05555"
+    return render_template_string(f"""<!DOCTYPE html><html data-theme="light" lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Email Verification — JH Portal</title><style>{BASE_STYLES}</style></head><body style="display:flex;align-items:center;justify-content:center;min-height:100vh;background:var(--bg)"><div style="max-width:460px;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:40px;text-align:center;box-shadow:0 4px 32px rgba(0,0,0,.07)"><img src="/static/images/jh_logo.png" style="height:36px;margin-bottom:20px;object-fit:contain;" onerror="this.style.display='none'"><p style="font-size:15px;color:{colour};line-height:1.7">{msg}</p><a href="/" style="display:inline-block;margin-top:24px;color:var(--jh-teal);font-weight:600;font-size:14px">← Back to Portal</a></div></body></html>""")
+
+
+# ── Verification API endpoints ────────────────────────────────────────────────
+@app.route("/api/verify/email-status", methods=["POST"])
+def api_verify_email_status():
+    data = request.get_json(force=True) or {}
+    pid  = data.get("id", "")
+    pending = load_pending()
+    for p in pending:
+        if p["id"] == pid:
+            return jsonify({"verified": p.get("email_verified", False)})
+    return jsonify({"verified": False})
+
+@app.route("/api/verify/resend-email", methods=["POST"])
+def api_resend_email():
+    data = request.get_json(force=True) or {}
+    pid  = data.get("id", "")
+    pending = load_pending()
+    rec = next((p for p in pending if p["id"] == pid), None)
+    if not rec:
+        return jsonify({"ok": False, "message": "Registration not found."})
+    token = create_email_token(pid)
+    send_verification_email(rec["email"], rec["full_name"], pid, token)
+    return jsonify({"ok": True, "message": "Verification email resent. Check your inbox."})
+
+@app.route("/api/verify/otp", methods=["POST"])
+def api_verify_otp():
+    data = request.get_json(force=True) or {}
+    pid  = data.get("id", "")
+    otp  = data.get("otp", "").strip()
+    # Must also have email verified first
+    pending = load_pending()
+    rec = next((p for p in pending if p["id"] == pid), None)
+    if not rec:
+        return jsonify({"ok": False, "error": "Registration not found."})
+    if not rec.get("email_verified"):
+        return jsonify({"ok": False, "error": "Please verify your email first."})
+    ok, msg = verify_phone_otp(pid, otp)
+    if ok:
+        rec["phone_verified"] = True
+        rec["status"] = "Pending Admin"
+        save_pending(pending)
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": msg})
+
+@app.route("/api/verify/resend-otp", methods=["POST"])
+def api_resend_otp():
+    data = request.get_json(force=True) or {}
+    pid  = data.get("id", "")
+    pending = load_pending()
+    rec = next((p for p in pending if p["id"] == pid), None)
+    if not rec:
+        return jsonify({"ok": False, "message": "Registration not found."})
+    otp = create_phone_otp(pid)
+    send_otp_sms(rec["phone"], otp, rec["full_name"])
+    return jsonify({"ok": True, "message": "OTP resent to your phone."})
+
+
+# ── Admin: approve learner ────────────────────────────────────────────────────
+@app.route("/api/admin/approve-learner", methods=["POST"])
+@admin_required
+def api_approve_learner():
+    data = request.get_json(force=True) or {}
+    pid  = data.get("id", "")
+    pending = load_pending()
+    rec = next((p for p in pending if p["id"] == pid), None)
+    if not rec:
+        return jsonify({"ok": False, "error": "Pending registration not found."})
+
+    students = load_students()
+    n   = 1000 + len(students) + 1
+    sid = str(n)
+    first_name = rec["full_name"].split()[0].lower()
+    username   = f"learner.jh-{sid}"
+    password   = rec["password"]
+
+    new_student = {
+        "id": sid, "student_number": f"2026{sid}", "full_name": rec["full_name"],
+        "email": rec["email"], "phone": rec["phone"], "id_number": rec["id_number"],
+        "gender": rec["gender"], "address": rec["address"], "employment": "Unemployed",
+        "qualification": rec["programme"], "faculty": "Pending Assignment",
+        "programme": rec["programme"], "coordinator": "Pending Assignment",
+        "location": "Pending Assignment", "start_date": datetime.now().strftime("%Y-%m-%d"),
+        "status": "Active", "username": username, "password": password,
+        "campus": "Pending Assignment", "year_level": "Year 1",
+        "emergency_contact_name": "", "emergency_contact_phone": "",
+        "emergency_contact_relationship": "",
+        "modules": [], "tuition_balance": "R0",
+        "bursary_status": "Pending", "registration_status": "Registered",
+        "lms_link": "https://canvas.instructure.com/",
+        "portal_email": f"{first_name}.{sid}@student.jh.co.za",
+    }
+    students.insert(0, new_student)
+    save_students(students)
+
+    # Remove from pending
+    pending = [p for p in pending if p["id"] != pid]
+    save_pending(pending)
+
+    # Notify learner
+    email_result = send_approval_email(rec["email"], rec["full_name"], username, password)
+    email_sent = email_result is True
+    email_warning = None if email_sent else "Learner approved but approval email could not be sent — check Email Settings."
+
+    return jsonify({"ok": True, "student": new_student, "email_sent": email_sent, "email_warning": email_warning})
+
+@app.route("/api/admin/reject-learner", methods=["POST"])
+@admin_required
+def api_reject_learner():
+    data = request.get_json(force=True) or {}
+    pid  = data.get("id", "")
+    pending = load_pending()
+    pending = [p for p in pending if p["id"] != pid]
+    save_pending(pending)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/email-config", methods=["GET"])
+@admin_required
+def api_get_email_config():
+    cfg = load_email_config()
+    # Never expose the password
+    safe = {k: v for k, v in cfg.items() if k != "mail_pass"}
+    safe["has_password"] = bool(cfg.get("mail_pass"))
+    return jsonify({"ok": True, "config": safe})
+
+@app.route("/api/admin/email-config", methods=["POST"])
+@admin_required
+def api_save_email_config():
+    data = request.get_json(force=True) or {}
+    existing = load_email_config()
+    cfg = {
+        "mail_host": data.get("mail_host", "smtp.gmail.com").strip(),
+        "mail_port": int(data.get("mail_port", 587)),
+        "mail_user": data.get("mail_user", "").strip(),
+        "mail_from": data.get("mail_from", "").strip(),
+        # Keep existing password if not provided
+        "mail_pass": data.get("mail_pass", "").strip() or existing.get("mail_pass", ""),
+    }
+    if not cfg["mail_from"]:
+        cfg["mail_from"] = cfg["mail_user"]
+    save_email_config(cfg)
+    return jsonify({"ok": True})
+
+@app.route("/api/admin/email-test", methods=["POST"])
+@admin_required
+def api_test_email():
+    admin = current_admin()
+    to_addr = session.get("admin_email", "")
+    result = send_email(
+        to_addr,
+        "JH Portal — Email test ✅",
+        f"""<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:32px;background:#fff;border-radius:12px;border:1px solid #e0e0e0">
+          <h2 style="color:#00A89D;font-family:sans-serif">Email is working! 🎉</h2>
+          <p style="color:#555;font-size:14px">This test was sent from the JH Student Portal admin panel.</p>
+          <p style="color:#999;font-size:12px">Sent to: {to_addr}</p>
+        </div>"""
+    )
+    if result is True:
+        return jsonify({"ok": True, "message": f"Test email sent to {to_addr}"})
+    else:
+        return jsonify({"ok": False, "error": str(result) if result else "SMTP credentials not configured."})
+
+
+# ── Admin routes ──────────────────────────────────────────────────────────────
+@app.route("/admin/dashboard")
+@admin_required
+def admin_dashboard():
+    students = load_students()
+    active_count = len([s for s in students if s.get("status") == "Active"])
+    content = f"""
+<div class="page-header">
+  <h1>Admin Dashboard</h1>
+  <p>Overview of all student services operations — {datetime.now().strftime('%A, %d %B %Y')}</p>
+</div>
+<div class="grid-4" style="margin-bottom:24px">
+  <div class="stat-card">
+    <div class="stat-icon" style="background:rgba(0,168,157,.12)">👥</div>
+    <div class="stat-value">{len(students)}</div>
+    <div class="stat-label">Total Learners</div>
+    <div class="stat-change up">↑ Recently registered</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon" style="background:rgba(0,210,200,.12)">✅</div>
+    <div class="stat-value">{active_count}</div>
+    <div class="stat-label">Active Students</div>
+    <div class="stat-change neutral">Currently enrolled</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon" style="background:rgba(34,197,94,.12)">📚</div>
+    <div class="stat-value">{len(LEARNING_INTERVENTIONS)}</div>
+    <div class="stat-label">Programmes</div>
+    <div class="stat-change neutral">Running now</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon" style="background:rgba(255,107,107,.12)">📢</div>
+    <div class="stat-value">{len(ANNOUNCEMENTS)}</div>
+    <div class="stat-label">Announcements</div>
+    <div class="stat-change neutral">This week</div>
+  </div>
+</div>
+<div class="grid-2">
+  <div class="card">
+    <div class="card-title">Recent Learners</div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Name</th><th>Programme</th><th>Status</th></tr></thead>
+        <tbody>
+          {''.join(f'<tr><td><a href="/learners/{s["id"]}">{s["full_name"]}</a></td><td>{s.get("programme","—")[:30]}</td><td><span class="badge badge-green">{s.get("status","—")}</span></td></tr>' for s in students[:5])}
+        </tbody>
+      </table>
+    </div>
+    <a href="/learners" class="btn btn-secondary btn-sm" style="margin-top:14px">View All Learners →</a>
+  </div>
+  <div class="card">
+    <div class="card-title">Recent Notices</div>
+    {''.join(f'<div class="notice-card" style="margin-bottom:10px"><div class="notice-dot"></div><div><div style="font-weight:600;font-size:13.5px;color:var(--text)">{a["title"]}</div><div style="font-size:12px;color:var(--text-3);margin-top:2px">{a["category"]} · {a["date"]}</div></div></div>' for a in ANNOUNCEMENTS)}
+  </div>
+</div>
+<div style="margin-top:20px" class="grid-2">
+  <div class="card">
+    <div class="card-title">Active Programmes</div>
+    {''.join(f'<div style="padding:12px 0;border-bottom:1px solid var(--border)"><div style="font-weight:600;font-size:13.5px">{i["name"]}</div><div style="font-size:12px;color:var(--text-3);margin-top:2px">{i["participants"]} participants · {i["location"]}</div><div class="progress-bar" style="margin-top:8px"><div class="progress-fill" style="width:65%"></div></div></div>' for i in LEARNING_INTERVENTIONS)}
+  </div>
+  <div class="card">
+    <div class="card-title">Quick Actions</div>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <a href="/learners" class="btn btn-primary">➕ Register New Learner</a>
+      <a href="/documents" class="btn btn-secondary">📁 Manage Documents</a>
+      <a href="/clients" class="btn btn-secondary">🏢 View Clients</a>
+      <a href="/admin/profile" class="btn btn-secondary">⚙️ Admin Settings</a>
+    </div>
+  </div>
+</div>
+"""
+    return render_shell(content, "Dashboard", admin_sidebar("/admin/dashboard"), "Admin Dashboard")
+
+
+# ── Receptionist routes ───────────────────────────────────────────────────────
+@app.route("/receptionist/dashboard")
+@receptionist_required
+def receptionist_dashboard():
+    students = load_students()
+    active_count = len([s for s in students if s.get("status") == "Active"])
+    content = f"""
+<div class="page-header">
+  <h1>Receptionist Dashboard</h1>
+  <p>Manage day-to-day operations — {datetime.now().strftime('%A, %d %B %Y')}</p>
+</div>
+<div class="grid-4" style="margin-bottom:24px">
+  <div class="stat-card">
+    <div class="stat-icon" style="background:rgba(0,168,157,.12)">👥</div>
+    <div class="stat-value">{len(students)}</div>
+    <div class="stat-label">Total Learners</div>
+    <div class="stat-change up">↑ On roll</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon" style="background:rgba(0,210,200,.12)">✅</div>
+    <div class="stat-value">{active_count}</div>
+    <div class="stat-label">Active Today</div>
+    <div class="stat-change neutral">Enrolled learners</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon" style="background:rgba(34,197,94,.12)">📂</div>
+    <div class="stat-value">{len(CENTRAL_DOCUMENTS)}</div>
+    <div class="stat-label">Shared Docs</div>
+    <div class="stat-change neutral">Available</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon" style="background:rgba(255,107,107,.12)">📢</div>
+    <div class="stat-value">{len(ANNOUNCEMENTS)}</div>
+    <div class="stat-label">Announcements</div>
+    <div class="stat-change neutral">Posted</div>
+  </div>
+</div>
+<div class="grid-2">
+  <div class="card">
+    <div class="card-title">Recent Learners</div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Name</th><th>Programme</th><th>Status</th></tr></thead>
+        <tbody>
+          {''.join(f'<tr><td><a href="/receptionist/learners">{s["full_name"]}</a></td><td>{s.get("programme","—")[:30]}</td><td><span class="badge badge-green">{s.get("status","—")}</span></td></tr>' for s in students[:5])}
+        </tbody>
+      </table>
+    </div>
+    <a href="/receptionist/learners" class="btn btn-secondary btn-sm" style="margin-top:14px">Manage Learners →</a>
+  </div>
+  <div class="card">
+    <div class="card-title">Quick Actions</div>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <a href="/receptionist/learners" class="btn btn-primary">👥 Manage Learners</a>
+      <a href="/receptionist/documents" class="btn btn-secondary">📂 Share Documents</a>
+      <a href="/receptionist/attendance" class="btn btn-secondary">📋 Attendance</a>
+      <a href="/receptionist/reports" class="btn btn-secondary">📊 Generate Reports</a>
+    </div>
+  </div>
+</div>
+"""
+    return render_shell(content, "Dashboard", receptionist_sidebar("/receptionist/dashboard"), "Receptionist Dashboard")
+
+
+# ── Client routes ────────────────────────────────────────────────────────────
+@app.route("/client/dashboard")
+@client_required
+def client_dashboard():
+    students = load_students()
+    content = f"""
+<div class="page-header">
+  <h1>Client Portal Dashboard</h1>
+  <p>View sponsored learners and reports — {datetime.now().strftime('%A, %d %B %Y')}</p>
+</div>
+<div class="grid-4" style="margin-bottom:24px">
+  <div class="stat-card">
+    <div class="stat-icon" style="background:rgba(0,168,157,.12)">👥</div>
+    <div class="stat-value">{len(students)}</div>
+    <div class="stat-label">Total Sponsored</div>
+    <div class="stat-change up">↑ Enrolled</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon" style="background:rgba(0,210,200,.12)">✅</div>
+    <div class="stat-value">{len([s for s in students if s.get('status') == 'Active'])}</div>
+    <div class="stat-label">Active Learners</div>
+    <div class="stat-change neutral">Currently studying</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon" style="background:rgba(34,197,94,.12)">🎓</div>
+    <div class="stat-value">0</div>
+    <div class="stat-label">Certificates</div>
+    <div class="stat-change neutral">Issued</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon" style="background:rgba(255,107,107,.12)">📢</div>
+    <div class="stat-value">{len(ANNOUNCEMENTS)}</div>
+    <div class="stat-label">Notices</div>
+    <div class="stat-change neutral">Posted</div>
+  </div>
+</div>
+<div class="grid-2">
+  <div class="card">
+    <div class="card-title">Sponsored Learners</div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Name</th><th>Programme</th><th>Status</th></tr></thead>
+        <tbody>
+          {''.join(f'<tr><td><a href="/client/learners">{s["full_name"]}</a></td><td>{s.get("programme","—")[:30]}</td><td><span class="badge badge-green">{s.get("status","—")}</span></td></tr>' for s in students[:5])}
+        </tbody>
+      </table>
+    </div>
+    <a href="/client/learners" class="btn btn-secondary btn-sm" style="margin-top:14px">View All →</a>
+  </div>
+  <div class="card">
+    <div class="card-title">Quick Access</div>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <a href="/client/learners" class="btn btn-primary">👥 View Learners</a>
+      <a href="/client/reports" class="btn btn-secondary">📊 Performance Reports</a>
+      <a href="/client/certificates" class="btn btn-secondary">🎓 Certificates</a>
+    </div>
+  </div>
+</div>
+"""
+    return render_shell(content, "Dashboard", client_sidebar("/client/dashboard"), "Client Dashboard")
+
+
+# Placeholder routes for other sections
+@app.route("/receptionist/learners")
+@receptionist_required
+def receptionist_learners():
+    return render_shell("""
+<div class="page-header"><h1>Learner Management</h1><p>Register, update, and manage learners</p></div>
+<div class="card"><div class="card-title">Coming Soon</div><p>This section will allow you to manage learners.</p></div>
+""", "Learners", receptionist_sidebar("/receptionist/learners"), "Learner Management")
+
+@app.route("/receptionist/documents")
+@receptionist_required
+def receptionist_documents():
+    return render_shell("""
+<div class="page-header"><h1>Document Sharing</h1><p>Upload and share documents with all learners</p></div>
+<div class="card"><div class="card-title">Coming Soon</div><p>This section will allow you to share documents.</p></div>
+""", "Documents", receptionist_sidebar("/receptionist/documents"), "Document Sharing")
+
+@app.route("/receptionist/attendance")
+@receptionist_required
+def receptionist_attendance():
+    return render_shell("""
+<div class="page-header"><h1>Attendance</h1><p>Track learner attendance</p></div>
+<div class="card"><div class="card-title">Coming Soon</div><p>This section will allow you to manage attendance.</p></div>
+""", "Attendance", receptionist_sidebar("/receptionist/attendance"), "Attendance")
+
+@app.route("/receptionist/reports")
+@receptionist_required
+def receptionist_reports():
+    return render_shell("""
+<div class="page-header"><h1>Reports</h1><p>Generate reports</p></div>
+<div class="card"><div class="card-title">Coming Soon</div><p>This section will allow you to generate reports.</p></div>
+""", "Reports", receptionist_sidebar("/receptionist/reports"), "Reports")
+
+@app.route("/receptionist/announcements")
+@receptionist_required
+def receptionist_announcements():
+    return render_shell("""
+<div class="page-header"><h1>Announcements</h1><p>Manage announcements</p></div>
+<div class="card"><div class="card-title">Coming Soon</div><p>This section will allow you to manage announcements.</p></div>
+""", "Announcements", receptionist_sidebar("/receptionist/announcements"), "Announcements")
+
+@app.route("/receptionist/messages")
+@receptionist_required
+def receptionist_messages():
+    return render_shell("""
+<div class="page-header"><h1>Messages</h1><p>Communicate with learners and staff</p></div>
+<div class="card"><div class="card-title">Coming Soon</div><p>This section will allow you to manage messages.</p></div>
+""", "Messages", receptionist_sidebar("/receptionist/messages"), "Messages")
+
+@app.route("/client/learners")
+@client_required
+def client_learners():
+    return render_shell("""
+<div class="page-header"><h1>Sponsored Learners</h1><p>View learners sponsored by your organization</p></div>
+<div class="card"><div class="card-title">Coming Soon</div><p>This section will allow you to view sponsored learners.</p></div>
+""", "Learners", client_sidebar("/client/learners"), "Sponsored Learners")
+
+@app.route("/client/reports")
+@client_required
+def client_reports():
+    return render_shell("""
+<div class="page-header"><h1>Performance Reports</h1><p>View learner performance reports</p></div>
+<div class="card"><div class="card-title">Coming Soon</div><p>This section will allow you to view reports.</p></div>
+""", "Reports", client_sidebar("/client/reports"), "Performance Reports")
+
+@app.route("/client/certificates")
+@client_required
+def client_certificates():
+    return render_shell("""
+<div class="page-header"><h1>Certificates</h1><p>View and download learner certificates</p></div>
+<div class="card"><div class="card-title">Coming Soon</div><p>This section will allow you to view certificates.</p></div>
+""", "Certificates", client_sidebar("/client/certificates"), "Certificates")
+
+@app.route("/client/announcements")
+@client_required
+def client_announcements():
+    return render_shell("""
+<div class="page-header"><h1>Notices</h1><p>View important notices</p></div>
+<div class="card"><div class="card-title">Coming Soon</div><p>This section will allow you to view notices.</p></div>
+""", "Notices", client_sidebar("/client/announcements"), "Notices")
+
+@app.route("/client/messages")
+@client_required
+def client_messages():
+    return render_shell("""
+<div class="page-header"><h1>Messages</h1><p>Communicate with JH Skills</p></div>
+<div class="card"><div class="card-title">Coming Soon</div><p>This section will allow you to manage messages.</p></div>
+""", "Messages", client_sidebar("/client/messages"), "Messages")
+
+
+@app.route("/learners")
+@admin_required
+def learners():
+    students = load_students()
+    pending  = [p for p in load_pending() if p.get("status") == "Pending Admin"]
+    rows = "".join(f'''
+    <tr>
+      <td><a href="/learners/{s['id']}" style="font-weight:600">{s['full_name']}</a></td>
+      <td style="color:var(--text-2)">{s.get('student_number','')}</td>
+      <td>{s.get('programme','')[:35]}</td>
+      <td>{s.get('campus','')}</td>
+      <td><span class="badge badge-{'green' if s.get('status')=='Active' else 'gray'}">{s.get('status','')}</span></td>
+      <td><a href="/learners/{s['id']}" class="btn btn-secondary btn-sm">View</a></td>
+    </tr>''' for s in students)
+
+    pending_badge = f'<span style="background:#e05555;color:#fff;border-radius:20px;font-size:11px;font-weight:700;padding:2px 8px;margin-left:8px">{len(pending)}</span>' if pending else ''
+    pending_rows  = "".join(f'''
+    <tr id="pr-{p['id']}">
+      <td style="font-weight:600">{p['full_name']}</td>
+      <td style="color:var(--text-2)">{p.get('email','')}</td>
+      <td>{p.get('phone','')}</td>
+      <td>{p.get('programme','')[:35]}</td>
+      <td style="color:var(--text-3);font-size:12px">{p.get('submitted_at','')[:10]}</td>
+      <td>
+        <div style="display:flex;gap:6px">
+          <button onclick="approveLearner('{p['id']}')"
+            style="background:linear-gradient(135deg,#8DC63F,#00A89D);color:#fff;border:none;border-radius:6px;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;font-family:'Syne',sans-serif;white-space:nowrap">
+            ✅ Approve
+          </button>
+          <button onclick="rejectLearner('{p['id']}')"
+            style="background:none;border:1px solid #dc3535;color:#dc3535;border-radius:6px;padding:6px 10px;font-size:12px;cursor:pointer">
+            ✕
+          </button>
+        </div>
+      </td>
+    </tr>''' for p in pending)
+
+    pending_section = f"""
+<div class="card" style="margin-bottom:24px;border:1.5px solid rgba(229,115,115,.35);background:rgba(229,115,115,.04)">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+    <div class="card-title" style="margin:0;color:#c0392b">🔔 Pending Approvals{pending_badge}</div>
+    <span style="font-size:12px;color:var(--text-3)">{len(pending)} learner{'s' if len(pending)!=1 else ''} awaiting review</span>
+  </div>
+  <div class="table-wrap">
+    <table id="pendingTable">
+      <thead><tr><th>Full Name</th><th>Email</th><th>Phone</th><th>Programme</th><th>Submitted</th><th></th></tr></thead>
+      <tbody>{pending_rows}</tbody>
+    </table>
+  </div>
+</div>""" if pending else ""
+
+    content = f"""
+<div class="page-header" style="display:flex;align-items:center;justify-content:space-between">
+  <div><h1>Learner Register</h1><p>{len(students)} registered students{(' · ' + str(len(pending)) + ' pending approval') if pending else ''}</p></div>
+  <button class="quick-add" onclick="document.getElementById('regModal').style.display='flex'">➕ Register Learner</button>
+</div>
+
+{pending_section}
+
+<div class="card" style="margin-bottom:20px">
+  <div style="display:flex;gap:10px;align-items:center">
+    <div class="search-bar" style="flex:1">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+      <input id="searchInput" type="text" placeholder="Search learners..." oninput="filterTable(this.value)" style="width:100%">
+    </div>
+    <select class="btn btn-secondary" style="padding:9px 12px;cursor:pointer" onchange="filterStatus(this.value)">
+      <option value="">All Status</option>
+      <option>Active</option>
+      <option>Inactive</option>
+    </select>
+  </div>
+</div>
+<div class="table-wrap">
+  <table id="learnersTable">
+    <thead><tr><th>Full Name</th><th>Student No.</th><th>Programme</th><th>Campus</th><th>Status</th><th></th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</div>
+
+<!-- Registration Modal -->
+<div id="regModal" style="display:none;position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.55);align-items:center;justify-content:center;padding:20px">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:16px;width:100%;max-width:680px;max-height:90vh;overflow-y:auto;padding:32px;position:relative">
+    <button onclick="document.getElementById('regModal').style.display='none'" style="position:absolute;top:16px;right:16px;background:none;border:none;cursor:pointer;font-size:20px;color:var(--text-2)">✕</button>
+    <h2 style="font-family:'Syne',sans-serif;font-size:20px;margin-bottom:20px">Register New Learner</h2>
+    <div id="regMsg" style="display:none;margin-bottom:12px"></div>
+    <div class="grid-2">
+      <div class="field"><label>Full Name *</label><input name="full_name" placeholder="e.g. Thabo Mokoena"></div>
+      <div class="field"><label>Email *</label><input name="email" type="email" placeholder="email@student.jh.co.za"></div>
+      <div class="field"><label>Phone *</label><input name="phone" placeholder="+27 71 234 5678"></div>
+      <div class="field"><label>ID Number *</label><input name="id_number" placeholder="13-digit SA ID"></div>
+      <div class="field"><label>Gender *</label>
+        <select name="gender"><option>Male</option><option>Female</option><option>Other</option></select>
+      </div>
+      <div class="field"><label>Employment *</label>
+        <select name="employment"><option>Unemployed</option><option>Employed</option><option>Self-employed</option></select>
+      </div>
+      <div class="field"><label>Address *</label><input name="address" placeholder="City / Area"></div>
+      <div class="field"><label>Year Level *</label>
+        <select name="year_level"><option>Year 1</option><option>Year 2</option><option>Year 3</option></select>
+      </div>
+    </div>
+    <div class="field"><label>Qualification *</label><input name="qualification" placeholder="e.g. Diploma in IT"></div>
+    <div class="grid-2">
+      <div class="field"><label>Faculty *</label><input name="faculty" placeholder="e.g. Faculty of Sciences"></div>
+      <div class="field"><label>Programme *</label><input name="programme" placeholder="e.g. Digital Skills 2026"></div>
+      <div class="field"><label>Coordinator *</label><input name="coordinator" placeholder="Coordinator name"></div>
+      <div class="field"><label>Location *</label><input name="location" placeholder="e.g. Johannesburg Campus"></div>
+    </div>
+    <div class="grid-2">
+      <div class="field"><label>Start Date *</label><input name="start_date" type="date"></div>
+      <div class="field"><label>Status</label>
+        <select name="status"><option>Active</option><option>Inactive</option></select>
+      </div>
+      <div class="field"><label>Tuition Balance</label><input name="tuition_balance" placeholder="e.g. R15,000"></div>
+      <div class="field"><label>Bursary Status</label>
+        <select name="bursary_status"><option>Pending</option><option>Approved</option><option>Rejected</option></select>
+      </div>
+    </div>
+    <div class="field"><label>Modules (comma-separated) *</label><input name="modules" placeholder="e.g. Network Systems, Database Systems"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+      <div class="field"><label>Emergency Contact Name *</label><input name="emergency_contact_name" placeholder="Full name"></div>
+      <div class="field"><label>Emergency Phone *</label><input name="emergency_contact_phone" placeholder="+27 82 000 0000"></div>
+      <div class="field"><label>Relationship *</label><input name="emergency_contact_relationship" placeholder="e.g. Parent"></div>
+    </div>
+    <button class="btn btn-primary" onclick="registerStudent()" style="width:100%;justify-content:center;padding:12px;margin-top:8px">Register Learner</button>
+  </div>
+</div>
+<script>
+function filterTable(q) {{
+  q = q.toLowerCase();
+  document.querySelectorAll('#learnersTable tbody tr').forEach(r => {{
+    r.style.display = r.textContent.toLowerCase().includes(q) ? '' : 'none';
+  }});
+}}
+function filterStatus(s) {{
+  document.querySelectorAll('#learnersTable tbody tr').forEach(r => {{
+    r.style.display = (!s || r.textContent.includes(s)) ? '' : 'none';
+  }});
+}}
+async function registerStudent() {{
+  const modal = document.getElementById('regModal');
+  const data = new FormData();
+  modal.querySelectorAll('[name]').forEach(el => data.append(el.name, el.value));
+  const res = await fetch('/api/admin/students', {{method:'POST', body:data}});
+  const json = await res.json();
+  const msg = document.getElementById('regMsg');
+  msg.style.display = 'block';
+  if(json.ok) {{
+    msg.style.cssText = 'display:block;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.2);border-radius:8px;padding:10px 14px;color:#16a34a;font-size:13px';
+    msg.textContent = '✓ ' + json.message + ' — Username: ' + json.student.username + ' | Password: ' + json.student.password;
+    setTimeout(() => location.reload(), 2000);
+  }} else {{
+    msg.style.cssText = 'display:block;background:rgba(255,107,107,.08);border:1px solid rgba(255,107,107,.2);border-radius:8px;padding:10px 14px;color:#e05555;font-size:13px';
+    msg.textContent = '⚠️ ' + json.message;
+  }}
+}}
+
+async function approveLearner(id) {{
+  const btn = document.querySelector(`#pr-${{id}} button`);
+  if (btn) {{ btn.textContent = 'Approving…'; btn.disabled = true; }}
+  const res = await fetch('/api/admin/approve-learner', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{id}})
+  }});
+  const json = await res.json();
+  if (json.ok) {{
+    const row = document.getElementById(`pr-${{id}}`);
+    if (row) {{
+      row.style.background = 'rgba(34,197,94,.08)';
+      const statusMsg = json.email_sent
+        ? '✅ Approved — email sent'
+        : '✅ Approved <span style="color:#F5C518;font-size:11px">(email not sent — check Settings)</span>';
+      row.cells[5].innerHTML = `<span style="color:#16a34a;font-size:13px;font-weight:600">${{statusMsg}}</span>`;
+      setTimeout(() => {{ row.remove(); checkEmptyPending(); }}, 3000);
+    }}
+  }} else {{
+    alert(json.error || 'Approval failed.');
+    if (btn) {{ btn.textContent = '✅ Approve'; btn.disabled = false; }}
+  }}
+}}
+
+async function rejectLearner(id) {{
+  if (!confirm('Remove this registration?')) return;
+  const res = await fetch('/api/admin/reject-learner', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{id}})
+  }});
+  const json = await res.json();
+  if (json.ok) {{
+    const row = document.getElementById(`pr-${{id}}`);
+    if (row) {{ row.remove(); checkEmptyPending(); }}
+  }}
+}}
+
+function checkEmptyPending() {{
+  const tbody = document.querySelector('#pendingTable tbody');
+  if (tbody && tbody.rows.length === 0) {{
+    const card = tbody.closest('.card');
+    if (card) card.remove();
+  }}
+}}
+</script>
+"""
+    return render_shell(content, "Learners", admin_sidebar("/learners"), "Learner Register")
+
+
+@app.route("/learners/<student_id>")
+@admin_required
+def learner_profile(student_id):
+    student = get_student_by_id(student_id)
+    if not student: raise NotFound()
+    docs = get_learner_documents(student_id)
+    checklist = get_document_checklist(student_id)
+    progress = int(checklist["required_uploaded"] / max(checklist["required_total"], 1) * 100)
+    content = f"""
+<div class="page-header" style="display:flex;align-items:center;gap:12px">
+  <a href="/learners" class="btn btn-secondary btn-sm">← Back</a>
+  <div><h1>{student['full_name']}</h1><p>Student #{student['student_number']} · {student.get('programme','')}</p></div>
+  <span class="badge badge-green" style="margin-left:auto">{student.get('status','')}</span>
+</div>
+<div class="grid-2" style="margin-bottom:20px">
+  <div class="card">
+    <div class="card-title">Personal Information</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 20px;font-size:13.5px">
+      <div><span style="color:var(--text-3)">Email</span><div>{student.get('email','')}</div></div>
+      <div><span style="color:var(--text-3)">Phone</span><div>{student.get('phone','')}</div></div>
+      <div><span style="color:var(--text-3)">Gender</span><div>{student.get('gender','')}</div></div>
+      <div><span style="color:var(--text-3)">ID Number</span><div>{student.get('id_number','')}</div></div>
+      <div><span style="color:var(--text-3)">Address</span><div>{student.get('address','')}</div></div>
+      <div><span style="color:var(--text-3)">Employment</span><div>{student.get('employment','')}</div></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Academic Information</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 20px;font-size:13.5px">
+      <div><span style="color:var(--text-3)">Campus</span><div>{student.get('campus','')}</div></div>
+      <div><span style="color:var(--text-3)">Year</span><div>{student.get('year_level','')}</div></div>
+      <div><span style="color:var(--text-3)">Tuition</span><div>{student.get('tuition_balance','')}</div></div>
+      <div><span style="color:var(--text-3)">Bursary</span><div>{student.get('bursary_status','')}</div></div>
+      <div><span style="color:var(--text-3)">Username</span><div><code style="background:var(--bg-2);padding:2px 6px;border-radius:4px">{student.get('username','')}</code></div></div>
+      <div><span style="color:var(--text-3)">Password</span><div><code style="background:var(--bg-2);padding:2px 6px;border-radius:4px">{student.get('password','')}</code></div></div>
+    </div>
+  </div>
+</div>
+<div class="card" style="margin-bottom:20px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+    <div class="card-title">Document Checklist ({checklist['required_uploaded']}/{checklist['required_total']} required)</div>
+    <span class="badge badge-{'green' if progress==100 else 'purple'}">{progress}% complete</span>
+  </div>
+  <div class="progress-bar" style="margin-bottom:16px"><div class="progress-fill" style="width:{progress}%"></div></div>
+  <div class="grid-2">
+    {''.join(f'''<div style="padding:10px;background:var(--bg-2);border-radius:8px;border:1px solid var(--border)">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span>{'✅' if item['uploaded'] else '⬜'}</span>
+        <div><div style="font-weight:600;font-size:13px">{item['label']}</div>
+        <div style="font-size:11px;color:var(--text-3)">{'Required' if item['required'] else 'Optional'} · {item['count']} file(s)</div></div>
+      </div></div>''' for item in checklist['items'])}
+  </div>
+  <div style="margin-top:16px">
+    <div class="card-title">Upload Document</div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <select id="docCat" class="btn btn-secondary" style="padding:9px 12px">
+        {''.join(f'<option value="{dt["id"]}">{dt["label"]}</option>' for dt in LEARNER_DOCUMENT_TYPES)}
+      </select>
+      <input type="file" id="docFile" style="flex:1;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg-2);color:var(--text);font-size:13px">
+      <button class="btn btn-primary" onclick="uploadDoc('{student_id}')">Upload</button>
+    </div>
+    <div id="uploadMsg" style="margin-top:8px;font-size:13px"></div>
+  </div>
+</div>
+{''.join(f'''<div class="notice-card" style="margin-bottom:8px"><div class="notice-dot"></div>
+  <div><div style="font-weight:600;font-size:13px">{d['category_label']}</div>
+  <div style="font-size:12px;color:var(--text-3)">{d['original_name']} · {d['uploaded_at']}</div>
+  <div style="display:flex;gap:8px;margin-top:6px">
+    <a href="{d['view_url']}" target="_blank" class="btn btn-secondary btn-sm">View</a>
+    <a href="{d['download_url']}" class="btn btn-secondary btn-sm">Download</a>
+  </div></div></div>''' for d in docs) if docs else '<div class="card" style="text-align:center;color:var(--text-3)">No documents uploaded yet</div>'}
+<script>
+async function uploadDoc(lid){{
+  const cat=document.getElementById('docCat').value;
+  const file=document.getElementById('docFile').files[0];
+  if(!file){{document.getElementById('uploadMsg').innerHTML='<span style="color:#e05555">Please select a file.</span>';return;}}
+  const fd=new FormData();fd.append('document_category',cat);fd.append('document_file',file);
+  const res=await fetch(`/learners/${{lid}}/documents/upload`,{{method:'POST',body:fd}});
+  const j=await res.json();
+  document.getElementById('uploadMsg').innerHTML=j.ok?'<span style="color:#16a34a">✓ '+j.message+'</span>':'<span style="color:#e05555">⚠️ '+j.message+'</span>';
+  if(j.ok)setTimeout(()=>location.reload(),1200);
+}}
+</script>
+"""
+    return render_shell(content, student["full_name"], admin_sidebar("/learners"), student["full_name"])
+
+
+@app.route("/admin/interventions")
+@admin_required
+def admin_interventions():
+    content = f"""
+<div class="page-header"><h1>Programmes & Interventions</h1><p>All active learning programmes</p></div>
+<div class="grid-2">
+  {''.join(f'''<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start">
+      <span class="badge badge-purple">{i['id']}</span>
+      <span class="badge badge-green">Active</span>
+    </div>
+    <h3 style="margin:12px 0 8px;font-family:'Syne',sans-serif">{i['name']}</h3>
+    <p style="color:var(--text-2);font-size:13.5px">{i['programme']}</p>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px;font-size:13px">
+      <div><span style="color:var(--text-3)">Participants</span><div style="font-weight:600">{i['participants']}</div></div>
+      <div><span style="color:var(--text-3)">Location</span><div>{i['location']}</div></div>
+      <div><span style="color:var(--text-3)">Start</span><div>{i['start_date']}</div></div>
+      <div><span style="color:var(--text-3)">End</span><div>{i['end_date']}</div></div>
+    </div>
+    <div style="margin-top:12px;padding:10px;background:var(--bg-2);border-radius:8px;font-size:12.5px;color:var(--text-2)">{i['expectations']}</div>
+  </div>''' for i in LEARNING_INTERVENTIONS)}
+</div>
+"""
+    return render_shell(content, "Programmes", admin_sidebar("/admin/interventions"), "Programmes")
+
+
+@app.route("/documents")
+@admin_required
+def documents():
+    docs = load_central_document_store()
+    content = f"""
+<div class="page-header" style="display:flex;justify-content:space-between;align-items:center">
+  <div><h1>Document Repository</h1><p>{len(docs)} documents stored</p></div>
+  <button class="quick-add" onclick="document.getElementById('uploadBox').style.display='block'">➕ Upload Document</button>
+</div>
+<div id="uploadBox" class="card" style="display:none;margin-bottom:20px">
+  <div class="card-title">Upload New Document</div>
+  <div style="display:flex;gap:10px;flex-wrap:wrap">
+    <input id="docName" placeholder="Document name" style="flex:1;padding:9px 14px;border:1.5px solid var(--border);border-radius:8px;background:var(--bg-2);color:var(--text);font-size:13px;outline:none">
+    <input type="file" id="docFile2" style="flex:1;padding:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg-2);color:var(--text)">
+    <button class="btn btn-primary" onclick="uploadCentral()">Upload</button>
+  </div>
+  <div id="uploadMsg2" style="margin-top:8px;font-size:13px"></div>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Document Name</th><th>ID</th><th>Updated</th><th>Status</th><th></th></tr></thead>
+    <tbody>
+      {''.join(f'''<tr>
+        <td style="font-weight:600">{d['name']}</td>
+        <td style="color:var(--text-3);font-size:12px">{d['id']}</td>
+        <td style="color:var(--text-2)">{d['updated']}</td>
+        <td><span class="badge badge-green">{d['status']}</span></td>
+        <td><a href="/static/uploads/documents/{d['stored_name']}" target="_blank" class="btn btn-secondary btn-sm">View</a></td>
+      </tr>''' for d in docs) if docs else '<tr><td colspan="5" style="text-align:center;color:var(--text-3);padding:32px">No documents uploaded yet</td></tr>'}
+    </tbody>
+  </table>
+</div>
+<script>
+async function uploadCentral(){{
+  const name=document.getElementById('docName').value.trim();
+  const file=document.getElementById('docFile2').files[0];
+  if(!name||!file){{document.getElementById('uploadMsg2').innerHTML='<span style="color:#e05555">Please complete all fields.</span>';return;}}
+  const fd=new FormData();fd.append('name',name);fd.append('document_file',file);
+  const res=await fetch('/documents/upload',{{method:'POST',body:fd}});
+  const j=await res.json();
+  if(j.ok)location.reload();
+  else document.getElementById('uploadMsg2').innerHTML='<span style="color:#e05555">'+j.message+'</span>';
+}}
+</script>
+"""
+    return render_shell(content, "Documents", admin_sidebar("/documents"), "Documents")
+
+
+@app.route("/clients")
+@admin_required
+def clients():
+    content = f"""
+<div class="page-header"><h1>Client Companies</h1><p>{JH_GROUP['tagline']}</p></div>
+<div class="grid-2">
+  {''.join(f'''<div class="card" style="cursor:pointer" onclick="location.href='/clients/{c['id']}'">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start">
+      <div class="logo-mark" style="font-size:12px;width:40px;height:40px">{c['name'][:2].upper()}</div>
+      <span class="badge badge-green">{c['status']}</span>
+    </div>
+    <h3 style="margin:12px 0 6px;font-family:'Syne',sans-serif">{c['name']}</h3>
+    <p style="color:var(--text-2);font-size:13.5px">{c['focus']}</p>
+    <div style="margin-top:12px;font-size:12.5px;color:var(--text-3)">{c['contact']} · {c['phone']}</div>
+  </div>''' for c in JH_GROUP['companies'])}
+</div>
+"""
+    return render_shell(content, "Clients", admin_sidebar("/clients"), "Clients")
+
+
+@app.route("/clients/<company_id>")
+@admin_required
+def company_profile(company_id):
+    company = next((c for c in JH_GROUP["companies"] if c["id"] == company_id), None)
+    if not company: raise NotFound()
+    content = f"""
+<div class="page-header" style="display:flex;align-items:center;gap:12px">
+  <a href="/clients" class="btn btn-secondary btn-sm">← Back</a>
+  <div><h1>{company['name']}</h1><p>{company['focus']}</p></div>
+</div>
+<div class="grid-2">
+  <div class="card">
+    <div class="card-title">Contact Details</div>
+    <p style="font-size:13.5px;color:var(--text-2)">📧 {company['contact']}</p>
+    <p style="font-size:13.5px;color:var(--text-2);margin-top:8px">📞 {company['phone']}</p>
+  </div>
+  <div class="card">
+    <div class="card-title">Status</div>
+    <span class="badge badge-green" style="font-size:14px;padding:6px 16px">{company['status']}</span>
+  </div>
+</div>
+"""
+    return render_shell(content, company["name"], admin_sidebar("/clients"), company["name"])
+
+
+@app.route("/admin/activity")
+@admin_required
+def admin_activity():
+    content = """
+<div class="page-header"><h1>Activity Feed</h1><p>Recent system events and actions</p></div>
+<div class="card">
+  <div class="activity-item"><div class="activity-icon" style="background:rgba(0,168,157,.1)">👥</div><div class="activity-content"><div class="activity-text"><strong>Thabo Mokoena</strong> registered — Diploma in IT</div><div class="activity-time">2 hours ago</div></div></div>
+  <div class="activity-item"><div class="activity-icon" style="background:rgba(0,210,200,.1)">📁</div><div class="activity-content"><div class="activity-text"><strong>Ayanda Dlamini</strong> uploaded ID document</div><div class="activity-time">4 hours ago</div></div></div>
+  <div class="activity-item"><div class="activity-icon" style="background:rgba(34,197,94,.1)">📢</div><div class="activity-content"><div class="activity-text">New announcement: <strong>Exam timetable released</strong></div><div class="activity-time">Yesterday at 14:30</div></div></div>
+  <div class="activity-item"><div class="activity-icon" style="background:rgba(255,107,107,.1)">⚙️</div><div class="activity-content"><div class="activity-text"><strong>Admin</strong> updated learner status</div><div class="activity-time">2 days ago</div></div></div>
+</div>
+"""
+    return render_shell(content, "Activity", admin_sidebar("/admin/activity"), "Activity Feed")
+
+
+@app.route("/admin/profile")
+@admin_required
+def admin_profile():
+    admin = current_admin()
+    content = f"""
+<div class="page-header"><h1>Admin Settings</h1></div>
+<div class="grid-2">
+  <div class="card">
+    <div class="card-title">Profile</div>
+    <div style="display:flex;align-items:center;gap:16px;margin-bottom:16px">
+      <div class="user-avatar" style="width:64px;height:64px;font-size:22px;border-radius:16px">{admin['name'][0]}</div>
+      <div><div style="font-family:'Syne',sans-serif;font-weight:700;font-size:18px">{admin['name']}</div>
+      <div class="badge badge-purple">{admin['role_label']}</div></div>
+    </div>
+    <div class="field"><label>Email</label><input value="{session.get('admin_email','')}" readonly style="opacity:.7"></div>
+    <div class="field"><label>Company Scope</label><input value="JH Student Services" readonly style="opacity:.7"></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Theme Preference</div>
+    <p style="color:var(--text-2);font-size:13.5px;margin-bottom:16px">Toggle between light and dark mode using the button in the top bar, or click below.</p>
+    <button class="btn btn-secondary" onclick="toggleTheme()">🌙 Toggle Dark / Light Mode</button>
+  </div>
+</div>
+
+<div class="card" style="margin-top:24px">
+  <div class="card-title">📧 Email Settings (SMTP)</div>
+  <p style="color:var(--text-2);font-size:13px;margin-bottom:20px">
+    Configure the SMTP account used to send verification and approval emails to learners.
+    For Gmail, use an <strong>App Password</strong> (not your regular password) — 
+    <a href="https://support.google.com/accounts/answer/185833" target="_blank" style="color:var(--brand)">learn how</a>.
+  </p>
+
+  <div id="emailConfigStatus" style="margin-bottom:16px"></div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+    <div class="field">
+      <label>SMTP Host</label>
+      <input id="cfgHost" placeholder="smtp.gmail.com">
+    </div>
+    <div class="field">
+      <label>SMTP Port</label>
+      <input id="cfgPort" placeholder="587" type="number">
+    </div>
+    <div class="field">
+      <label>Login Email (MAIL_USER)</label>
+      <input id="cfgUser" placeholder="yourname@gmail.com" type="email">
+    </div>
+    <div class="field">
+      <label>From Address (optional)</label>
+      <input id="cfgFrom" placeholder="Same as login email">
+    </div>
+    <div class="field" style="grid-column:1/-1">
+      <label>App Password <span style="color:var(--text-3);font-weight:400">(leave blank to keep existing)</span></label>
+      <input id="cfgPass" placeholder="••••••••••••••••" type="password" autocomplete="new-password">
+    </div>
+  </div>
+
+  <div style="display:flex;gap:10px;flex-wrap:wrap">
+    <button class="btn btn-primary" onclick="saveEmailConfig()">💾 Save Settings</button>
+    <button class="btn btn-secondary" onclick="testEmail()">📨 Send Test Email</button>
+  </div>
+  <div id="emailActionMsg" style="margin-top:12px;font-size:13px;min-height:20px"></div>
+</div>
+
+<script>
+async function loadEmailConfig() {{
+  const res = await fetch('/api/admin/email-config');
+  const data = await res.json();
+  if (!data.ok) return;
+  const c = data.config;
+  document.getElementById('cfgHost').value = c.mail_host || 'smtp.gmail.com';
+  document.getElementById('cfgPort').value = c.mail_port || 587;
+  document.getElementById('cfgUser').value = c.mail_user || '';
+  document.getElementById('cfgFrom').value = c.mail_from || '';
+  const status = document.getElementById('emailConfigStatus');
+  if (c.mail_user && c.has_password) {{
+    status.innerHTML = '<span style="color:#8DC63F;font-size:13px">✅ Email is configured — credentials saved</span>';
+  }} else {{
+    status.innerHTML = '<span style="color:#F5C518;font-size:13px">⚠️ Email not fully configured — learner emails will not send</span>';
+  }}
+}}
+
+async function saveEmailConfig() {{
+  const msg = document.getElementById('emailActionMsg');
+  msg.textContent = 'Saving...';
+  const res = await fetch('/api/admin/email-config', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{
+      mail_host: document.getElementById('cfgHost').value.trim(),
+      mail_port: document.getElementById('cfgPort').value,
+      mail_user: document.getElementById('cfgUser').value.trim(),
+      mail_from: document.getElementById('cfgFrom').value.trim(),
+      mail_pass: document.getElementById('cfgPass').value,
+    }})
+  }});
+  const data = await res.json();
+  if (data.ok) {{
+    msg.innerHTML = '<span style="color:#8DC63F">✅ Settings saved.</span>';
+    document.getElementById('cfgPass').value = '';
+    loadEmailConfig();
+  }} else {{
+    msg.innerHTML = '<span style="color:#dc3535">❌ ' + (data.error || 'Error saving.') + '</span>';
+  }}
+}}
+
+async function testEmail() {{
+  const msg = document.getElementById('emailActionMsg');
+  msg.textContent = 'Sending test email...';
+  const res = await fetch('/api/admin/email-test', {{ method: 'POST' }});
+  const data = await res.json();
+  if (data.ok) {{
+    msg.innerHTML = '<span style="color:#8DC63F">✅ ' + data.message + '</span>';
+  }} else {{
+    msg.innerHTML = '<span style="color:#dc3535">❌ ' + (data.error || 'Failed.') + '</span>';
+  }}
+}}
+
+loadEmailConfig();
+</script>
+"""
+    return render_shell(content, "Settings", admin_sidebar("/admin/profile"), "Settings")
+
+
+# ── API ────────────────────────────────────────────────────────────────────────
+@app.route("/api/admin/students", methods=["GET", "POST"])
+@admin_required
+def admin_students_api():
+    students = load_students()
+    if request.method == "GET": return jsonify({"students": students})
+    payload = {k: request.form.get(k, "") for k in ["full_name","email","phone","id_number","gender","address","employment","qualification","faculty","programme","coordinator","location","start_date","status","year_level","emergency_contact_name","emergency_contact_phone","emergency_contact_relationship","modules","tuition_balance","bursary_status"]}
+    if any(not v.strip() for k, v in payload.items() if k not in {"tuition_balance","bursary_status"}):
+        return jsonify({"ok": False, "message": "Please complete all required fields."}), 400
+    if any(s["email"].lower() == payload["email"].strip().lower() for s in students):
+        return jsonify({"ok": False, "message": "A student with that email already exists."}), 400
+    new_student = create_student_payload(payload, len(students))
+    students.insert(0, new_student)
+    save_students(students)
+    return jsonify({"ok": True, "message": "Student registered successfully.", "student": new_student, "students": students})
+
+
+# ── Student routes ────────────────────────────────────────────────────────────
+@app.route("/student/dashboard")
+@student_required
+def student_dashboard():
+    student = current_student()
+    done = len([t for t in STUDENT_TASKS if t["status"] == "Done"])
+    content = f"""
+<div class="page-header">
+  <h1>Welcome back, {student['full_name'].split()[0]} 👋</h1>
+  <p>{student['programme']} · {student['campus']} · {datetime.now().strftime('%A, %d %B %Y')}</p>
+</div>
+<div class="grid-4" style="margin-bottom:24px">
+  <div class="stat-card"><div class="stat-icon" style="background:rgba(0,168,157,.12)">📚</div><div class="stat-value">{len(student.get('modules',[]))}</div><div class="stat-label">Modules</div></div>
+  <div class="stat-card"><div class="stat-icon" style="background:rgba(0,210,200,.12)">✅</div><div class="stat-value">{done}/{len(STUDENT_TASKS)}</div><div class="stat-label">Tasks Done</div></div>
+  <div class="stat-card"><div class="stat-icon" style="background:rgba(255,107,107,.12)">📢</div><div class="stat-value">{len(ANNOUNCEMENTS)}</div><div class="stat-label">Notices</div></div>
+  <div class="stat-card"><div class="stat-icon" style="background:rgba(34,197,94,.12)">💰</div><div class="stat-value" style="font-size:20px">{student.get('tuition_balance','—')}</div><div class="stat-label">Tuition Balance</div></div>
+</div>
+<div class="grid-2">
+  <div>
+    <div class="card" style="margin-bottom:20px">
+      <div class="card-title">Today's Schedule</div>
+      {''.join(f'''<div style="display:flex;gap:12px;align-items:center;padding:10px 0;border-bottom:1px solid var(--border)">
+        <div style="font-family:'Syne',sans-serif;font-size:12px;color:var(--jh-teal);min-width:72px">{t['time']}</div>
+        <div><div style="font-weight:600;font-size:13.5px">{t['lesson']}</div>
+        <div style="font-size:12px;color:var(--text-3)">{t['teacher']} · {t['location']}</div></div></div>''' for t in TIMETABLE_ITEMS)}
+    </div>
+    <div class="card">
+      <div class="card-title">My Notes</div>
+      {''.join(f'<div class="note-card {n["tone"]}" style="margin-bottom:10px"><div style="font-weight:600;font-size:13px">{n["title"]}</div><div style="font-size:13px;color:var(--text-2);margin-top:4px">{n["body"]}</div><div style="font-size:11px;color:var(--text-3);margin-top:6px">{n["date"]}</div></div>' for n in STUDENT_NOTES)}
+      <a href="/student/notes" class="btn btn-secondary btn-sm" style="margin-top:8px">View All Notes</a>
+    </div>
+  </div>
+  <div>
+    <div class="card" style="margin-bottom:20px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <div class="card-title" style="margin:0">My Tasks</div>
+        <a href="/student/tasks" style="font-size:12px;color:var(--jh-teal)">View All</a>
+      </div>
+      {''.join(f'''<div class="task-card {'todo' if t['status']=='To Do' else 'in-progress' if t['status']=='In Progress' else 'done'}" style="margin-bottom:10px">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start">
+          <div style="font-weight:600;font-size:13.5px">{t['title']}</div>
+          <span class="badge {'badge-teal' if t['status']=='Done' else 'badge-purple' if t['status']=='In Progress' else 'badge-gray'}">{t['status']}</span>
+        </div>
+        <div class="task-meta"><span>📦 {t['module']}</span><span>📅 {t['due_date']}</span></div>
+        <div class="progress-bar"><div class="progress-fill" style="width:{t['progress']}%"></div></div>
+      </div>''' for t in STUDENT_TASKS)}
+    </div>
+    <div class="card">
+      <div class="card-title">Announcements</div>
+      {''.join(f'<div class="notice-card" style="margin-bottom:10px"><div class="notice-dot"></div><div><div style="font-weight:600;font-size:13px">{a["title"]}</div><div style="font-size:12px;color:var(--text-3)">{a["category"]} · {a["date"]}</div></div></div>' for a in ANNOUNCEMENTS[:2])}
+      <a href="/student/announcements" class="btn btn-secondary btn-sm" style="margin-top:8px">View All</a>
+    </div>
+  </div>
+</div>
+"""
+    return render_shell(content, "Dashboard", student_sidebar("/student/dashboard"), f"Welcome, {student['full_name'].split()[0]}")
+
+
+@app.route("/student/profile", methods=["GET","POST"])
+@student_required
+def student_profile():
+    student = current_student()
+    if request.method == "POST":
+        students = load_students()
+        for item in students:
+            if str(item["id"]) == str(student["id"]):
+                for field in ["phone","address","email","emergency_contact_name","emergency_contact_phone","emergency_contact_relationship"]:
+                    item[field] = request.form.get(field, item[field]).strip()
+                break
+        save_students(students)
+        return redirect(url_for("student_profile"))
+    student = get_student_by_id(student["id"])
+    checklist = get_document_checklist(student["id"])
+    progress = int(checklist["required_uploaded"] / max(checklist["required_total"],1) * 100)
+    content = f"""
+<div class="page-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+  <div>
+    <h1>My Profile</h1>
+    <p>Manage your personal information</p>
+  </div>
+
+</div>
+<div class="grid-2">
+  <div class="card">
+    <div style="display:flex;align-items:center;gap:16px;margin-bottom:20px">
+      <div class="user-avatar" style="width:56px;height:56px;font-size:20px;border-radius:14px">{''.join(w[0] for w in student['full_name'].split()[:2])}</div>
+      <div><div style="font-family:'Syne',sans-serif;font-weight:700;font-size:18px">{student['full_name']}</div>
+      <div style="color:var(--text-2);font-size:13px">{student['student_number']}</div></div>
+    </div>
+    <form method="POST">
+    <div class="field"><label>Phone</label><input name="phone" value="{student.get('phone','')}"></div>
+    <div class="field"><label>Address</label><input name="address" value="{student.get('address','')}"></div>
+    <div class="field"><label>Email</label><input name="email" value="{student.get('email','')}"></div>
+    <div class="field"><label>Emergency Contact Name</label><input name="emergency_contact_name" value="{student.get('emergency_contact_name','')}"></div>
+    <div class="field"><label>Emergency Contact Phone</label><input name="emergency_contact_phone" value="{student.get('emergency_contact_phone','')}"></div>
+    <div class="field"><label>Relationship</label><input name="emergency_contact_relationship" value="{student.get('emergency_contact_relationship','')}"></div>
+    <button class="btn btn-primary" type="submit">Save Changes</button>
+    </form>
+  </div>
+  <div>
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-title">Academic Details</div>
+      <div style="display:grid;gap:8px;font-size:13.5px">
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--text-3)">Programme</span><span>{student.get('programme','')}</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--text-3)">Campus</span><span>{student.get('campus','')}</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--text-3)">Year Level</span><span>{student.get('year_level','')}</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:var(--text-3)">Bursary</span><span>{student.get('bursary_status','')}</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;margin-bottom:10px">
+        <div class="card-title" style="margin:0">Documents</div>
+        <span class="badge badge-{'green' if progress==100 else 'purple'}">{progress}%</span>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" style="width:{progress}%"></div></div>
+      <div style="margin-top:12px;display:flex;flex-direction:column;gap:6px">
+        {''.join(f'''<div style="display:flex;justify-content:space-between;font-size:13px">
+          <span>{'✅' if item['uploaded'] else '⬜'} {item['label']}</span>
+          <span style="color:var(--text-3)">{item['count']} file(s)</span>
+        </div>''' for item in checklist['items'])}
+      </div>
+      <div style="margin-top:14px">
+        <div class="card-title" style="font-size:12px">Upload</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+          <select id="sCat" style="flex:1;padding:8px;border:1.5px solid var(--border);border-radius:8px;background:var(--bg-2);color:var(--text);font-size:13px">
+            {''.join(f'<option value="{dt["id"]}">{dt["label"]}</option>' for dt in LEARNER_DOCUMENT_TYPES)}
+          </select>
+          <input type="file" id="sFile" style="flex:1;padding:7px;border:1px solid var(--border);border-radius:8px;background:var(--bg-2);color:var(--text)">
+          <button class="btn btn-primary btn-sm" onclick="sUpload('{student['id']}')">Upload</button>
+        </div>
+        <div id="sMsg" style="font-size:12px;margin-top:6px"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+async function sUpload(lid){{
+  const cat=document.getElementById('sCat').value;
+  const file=document.getElementById('sFile').files[0];
+  if(!file){{document.getElementById('sMsg').innerHTML='<span style="color:#e05555">Select a file.</span>';return;}}
+  const fd=new FormData();fd.append('document_category',cat);fd.append('document_file',file);
+  const res=await fetch('/student/documents/upload',{{method:'POST',body:fd}});
+  const j=await res.json();
+  document.getElementById('sMsg').innerHTML=j.ok?'<span style="color:#16a34a">✓ '+j.message+'</span>':'<span style="color:#e05555">'+j.message+'</span>';
+  if(j.ok)setTimeout(()=>location.reload(),1200);
+}}
+</script>
+"""
+    return render_shell(content, "Profile", student_sidebar("/student/profile"), "My Profile")
+
+
+@app.route("/student/tasks")
+@student_required
+def student_tasks():
+    todo = [t for t in STUDENT_TASKS if t["status"] == "To Do"]
+    inprog = [t for t in STUDENT_TASKS if t["status"] == "In Progress"]
+    done = [t for t in STUDENT_TASKS if t["status"] == "Done"]
+    def task_card(t):
+        cls = "todo" if t["status"]=="To Do" else "in-progress" if t["status"]=="In Progress" else "done"
+        badge = "badge-gray" if t["status"]=="To Do" else "badge-purple" if t["status"]=="In Progress" else "badge-teal"
+        return f'''<div class="task-card {cls}" style="margin-bottom:10px">
+          <div style="font-weight:600;font-size:13.5px">{t['title']}</div>
+          <span class="badge {badge}" style="margin-top:6px">{t['status']}</span>
+          <div class="task-meta"><span>📦 {t['module']}</span><span>📅 {t['due_date']}</span><span>💬 {t['comments']}</span></div>
+          <div class="progress-bar"><div class="progress-fill" style="width:{t['progress']}%"></div></div>
+          <div style="font-size:11px;color:var(--text-3);margin-top:4px">{t['progress']}% complete</div>
+        </div>'''
+    content = f"""
+<div class="page-header"><h1>My Tasks</h1><p>Kanban view of all assignments</p></div>
+<div class="kanban">
+  <div class="kanban-col">
+    <div class="kanban-header"><div class="kanban-title">🕐 To Do</div><div class="kanban-count">{len(todo)}</div></div>
+    {''.join(task_card(t) for t in todo) or '<div style="color:var(--text-3);font-size:13px;text-align:center;padding:20px">All done!</div>'}
+  </div>
+  <div class="kanban-col">
+    <div class="kanban-header"><div class="kanban-title">⚡ In Progress</div><div class="kanban-count">{len(inprog)}</div></div>
+    {''.join(task_card(t) for t in inprog)}
+  </div>
+  <div class="kanban-col">
+    <div class="kanban-header"><div class="kanban-title">✅ Done</div><div class="kanban-count">{len(done)}</div></div>
+    {''.join(task_card(t) for t in done)}
+  </div>
+</div>
+"""
+    return render_shell(content, "Tasks", student_sidebar("/student/tasks"), "My Tasks")
+
+
+@app.route("/student/timetable")
+@student_required
+def student_timetable():
+    content = f"""
+<div class="page-header"><h1>My Schedule</h1><p>Weekly timetable</p></div>
+<div class="card">
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Time</th><th>Lesson</th><th>Teacher</th><th>Location</th><th>Day</th></tr></thead>
+      <tbody>
+        {''.join(f'''<tr>
+          <td style="font-weight:600;color:var(--jh-teal)">{t['time']}</td>
+          <td>{t['lesson']}</td>
+          <td style="color:var(--text-2)">{t['teacher']}</td>
+          <td style="color:var(--text-2)">{t['location']}</td>
+          <td><span class="badge badge-purple">{t['day']}</span></td>
+        </tr>''' for t in TIMETABLE_ITEMS)}
+      </tbody>
+    </table>
+  </div>
+</div>
+"""
+    return render_shell(content, "Schedule", student_sidebar("/student/timetable"), "My Schedule")
+
+
+@app.route("/student/results")
+@student_required
+def student_results():
+    results = [
+        {"title": "Network Systems Test 1", "type": "Test", "score": "78%", "status": "Released"},
+        {"title": "Database Systems Practical", "type": "Assignment", "score": "84%", "status": "Released"},
+        {"title": "Information Security Exam", "type": "Final Exam", "score": "Pending", "status": "Awaiting Release"},
+    ]
+    content = f"""
+<div class="page-header"><h1>Assessments & Results</h1></div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Assessment</th><th>Type</th><th>Score</th><th>Status</th></tr></thead>
+    <tbody>
+      {''.join(f'''<tr>
+        <td style="font-weight:600">{r['title']}</td>
+        <td><span class="badge badge-gray">{r['type']}</span></td>
+        <td style="font-weight:700;color:{'var(--jh-teal)' if r['score']!='Pending' else 'var(--text-3)'}">{r['score']}</td>
+        <td><span class="badge {'badge-green' if r['status']=='Released' else 'badge-gray'}">{r['status']}</span></td>
+      </tr>''' for r in results)}
+    </tbody>
+  </table>
+</div>
+"""
+    return render_shell(content, "Assessments", student_sidebar("/student/results"), "Assessments")
+
+
+@app.route("/student/announcements")
+@student_required
+def student_announcements():
+    content = f"""
+<div class="page-header"><h1>Announcements</h1><p>{len(ANNOUNCEMENTS)} notices</p></div>
+<div style="display:flex;flex-direction:column;gap:12px">
+  {''.join(f'''<div class="card" style="border-left:3px solid var(--jh-teal)">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start">
+      <div>
+        <div style="font-weight:700;font-size:15px;font-family:'Syne',sans-serif">{a['title']}</div>
+        <div style="color:var(--text-2);font-size:13.5px;margin-top:6px">{a['summary']}</div>
+      </div>
+      <div style="text-align:right;flex-shrink:0;margin-left:16px">
+        <span class="badge badge-purple">{a['category']}</span>
+        <div style="font-size:11px;color:var(--text-3);margin-top:6px">{a['date']}</div>
+      </div>
+    </div>
+  </div>''' for a in ANNOUNCEMENTS)}
+</div>
+"""
+    return render_shell(content, "Announcements", student_sidebar("/student/announcements"), "Announcements")
+
+
+@app.route("/student/registration")
+@student_required
+def student_registration():
+    student = current_student()
+    content = f"""
+<div class="page-header"><h1>Registration</h1></div>
+<div class="grid-2">
+  <div class="card">
+    <div class="card-title">Enrolled Programme</div>
+    <div style="font-family:'Syne',sans-serif;font-size:18px;font-weight:700;margin-bottom:8px">{student.get('programme','')}</div>
+    <div style="font-size:13.5px;color:var(--text-2)">Start: {student.get('start_date','')} · Campus: {student.get('campus','')}</div>
+    <span class="badge badge-green" style="margin-top:10px">Registered</span>
+  </div>
+  <div class="card">
+    <div class="card-title">Modules</div>
+    {''.join(f'<div style="padding:8px 0;border-bottom:1px solid var(--border);font-size:13.5px">📚 {m}</div>' for m in student.get('modules',[]))}
+  </div>
+</div>
+<div style="margin-top:20px"><div class="card-title" style="margin-bottom:14px;font-family:\'Syne\',sans-serif;font-size:16px;font-weight:700">Available Programmes</div>
+<div class="grid-2">
+  {''.join(f'''<div class="card">
+    <span class="badge badge-gray">{i['id']}</span>
+    <h3 style="margin:10px 0 6px;font-family:'Syne',sans-serif">{i['name']}</h3>
+    <p style="font-size:13.5px;color:var(--text-2)">{i['programme']}</p>
+    <div style="font-size:12px;color:var(--text-3);margin-top:8px">{i['participants']} participants · {i['location']}</div>
+  </div>''' for i in LEARNING_INTERVENTIONS)}
+</div></div>
+"""
+    return render_shell(content, "Registration", student_sidebar("/student/registration"), "Registration")
+
+
+@app.route("/student/lms")
+@student_required
+def student_lms():
+    student = current_student()
+    content = f"""
+<div class="page-header"><h1>Learning Management</h1></div>
+<div class="card" style="margin-bottom:20px;text-align:center;padding:36px">
+  <div style="font-size:40px;margin-bottom:12px">💻</div>
+  <h2 style="font-family:'Syne',sans-serif">Canvas LMS</h2>
+  <p style="color:var(--text-2);margin:8px 0 20px">Access your course materials, submissions, and discussions on Canvas</p>
+  <a href="{student.get('lms_link','#')}" target="_blank" class="btn btn-primary" style="font-size:15px;padding:12px 28px">Open Canvas →</a>
+</div>
+<div class="card-title" style="margin-bottom:12px;font-family:'Syne',sans-serif;font-size:16px;font-weight:700">Recent Tasks</div>
+{''.join(f'''<div class="task-card {'done' if t['status']=='Done' else 'in-progress' if t['status']=='In Progress' else 'todo'}" style="margin-bottom:10px">
+  <div style="display:flex;justify-content:space-between"><div style="font-weight:600">{t['title']}</div><span class="badge {'badge-teal' if t['status']=='Done' else 'badge-purple' if t['status']=='In Progress' else 'badge-gray'}">{t['status']}</span></div>
+  <div class="task-meta"><span>{t['module']}</span><span>Due {t['due_date']}</span></div>
+</div>''' for t in STUDENT_TASKS)}
+"""
+    return render_shell(content, "LMS", student_sidebar("/student/lms"), "LMS")
+
+
+@app.route("/student/fees")
+@student_required
+def student_fees():
+    student = current_student()
+    content = f"""
+<div class="page-header"><h1>Fees & Finance</h1></div>
+<div class="grid-2">
+  <div class="stat-card">
+    <div class="stat-icon" style="background:rgba(255,107,107,.12)">💰</div>
+    <div class="stat-value" style="font-size:24px">{student.get('tuition_balance','—')}</div>
+    <div class="stat-label">Outstanding Balance</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon" style="background:rgba(34,197,94,.12)">🎓</div>
+    <div class="stat-value" style="font-size:20px">{student.get('bursary_status','—')}</div>
+    <div class="stat-label">Bursary Status</div>
+  </div>
+</div>
+<div class="card" style="margin-top:20px">
+  <div class="card-title">Payment Information</div>
+  <p style="color:var(--text-2);font-size:13.5px">For payment queries, contact the finance office at <a href="mailto:finance@jhstudent.co.za">finance@jhstudent.co.za</a></p>
+</div>
+"""
+    return render_shell(content, "Fees", student_sidebar("/student/fees"), "Fees")
+
+
+@app.route("/student/records")
+@student_required
+def student_records():
+    student = current_student()
+    docs = get_learner_documents(student["id"])
+    content = f"""
+<div class="page-header"><h1>My Records</h1></div>
+<div class="card" style="margin-bottom:20px">
+  <div class="card-title">Uploaded Documents ({len(docs)})</div>
+  {''.join(f'''<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border)">
+    <div><div style="font-weight:600;font-size:13.5px">{d['category_label']}</div>
+    <div style="font-size:12px;color:var(--text-3)">{d['original_name']} · {d['uploaded_at']}</div></div>
+    <div style="display:flex;gap:8px">
+      <a href="{d['view_url']}" target="_blank" class="btn btn-secondary btn-sm">View</a>
+      <a href="{d['download_url']}" class="btn btn-secondary btn-sm">⬇</a>
+    </div>
+  </div>''' for d in docs) if docs else '<p style="color:var(--text-3);font-size:13.5px">No documents uploaded yet.</p>'}
+</div>
+"""
+    return render_shell(content, "Records", student_sidebar("/student/records"), "Records")
+
+
+@app.route("/student/services")
+@student_required
+def student_services():
+    content = f"""
+<div class="page-header"><h1>Campus Services</h1></div>
+<div class="grid-3">
+  {''.join(f'''<div class="card">
+    <div style="font-size:28px;margin-bottom:10px">🏫</div>
+    <div style="font-weight:700;font-family:'Syne',sans-serif;margin-bottom:6px">{s['name']}</div>
+    <p style="color:var(--text-2);font-size:13.5px">{s['detail']}</p>
+    <span class="badge badge-green" style="margin-top:10px">{s['status']}</span>
+  </div>''' for s in CAMPUS_SERVICES)}
+</div>
+"""
+    return render_shell(content, "Services", student_sidebar("/student/services"), "Services")
+
+
+@app.route("/student/support")
+@student_required
+def student_support():
+    content = f"""
+<div class="page-header"><h1>Student Support</h1></div>
+<div class="grid-3">
+  {''.join(f'''<div class="card">
+    <div style="font-size:28px;margin-bottom:10px">🤝</div>
+    <div style="font-weight:700;font-family:'Syne',sans-serif;margin-bottom:6px">{s['name']}</div>
+    <p style="color:var(--text-2);font-size:13.5px">{s['detail']}</p>
+    <a href="mailto:{s['contact']}" class="btn btn-secondary btn-sm" style="margin-top:10px">📧 Contact</a>
+  </div>''' for s in SUPPORT_SERVICES)}
+</div>
+"""
+    return render_shell(content, "Support", student_sidebar("/student/support"), "Support")
+
+
+@app.route("/student/notes")
+@student_required
+def student_notes():
+    content = f"""
+<div class="page-header"><h1>My Notes</h1></div>
+<div class="grid-2">
+  {''.join(f'''<div class="note-card {n['tone']}">
+    <div style="font-weight:700;font-family:'Syne',sans-serif;margin-bottom:8px">{n['title']}</div>
+    <p style="font-size:13.5px;color:var(--text-2)">{n['body']}</p>
+    <div style="font-size:11px;color:var(--text-3);margin-top:10px">{n['date']}</div>
+  </div>''' for n in STUDENT_NOTES)}
+</div>
+"""
+    return render_shell(content, "Notes", student_sidebar("/student/notes"), "Notes")
+
+
+# ── Document upload routes ─────────────────────────────────────────────────────
+@app.route("/student/documents/upload", methods=["POST"])
+@student_required
+def student_document_upload():
+    return upload_document_for_learner(current_student()["id"])
+
+@app.route("/learners/<learner_id>/documents/upload", methods=["POST"])
+@admin_required
+def upload_learner_document(learner_id):
+    return upload_document_for_learner(learner_id)
+
+def upload_document_for_learner(learner_id):
+    cat = request.form.get("document_category", "").strip()
+    file = request.files.get("document_file")
+    if cat not in DOCUMENT_TYPE_LOOKUP:
+        return jsonify({"ok": False, "message": "Please select a valid document type."}), 400
+    if not file or not file.filename:
+        return jsonify({"ok": False, "message": "Please choose a file to upload."}), 400
+    if not is_allowed_document(file.filename):
+        return jsonify({"ok": False, "message": "Invalid file type. Allowed: " + ", ".join(sorted(ALLOWED_DOCUMENT_EXTENSIONS)).upper()}), 400
+    folder = os.path.join(LEARNER_UPLOADS_DIR, str(learner_id))
+    os.makedirs(folder, exist_ok=True)
+    orig = secure_filename(file.filename)
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    stored = f"{cat}_{ts}_{orig}"
+    file.save(os.path.join(folder, stored))
+    store = load_learner_document_store()
+    store.setdefault(str(learner_id), []).insert(0, {"id": f"{learner_id}-{ts}", "category": cat, "category_label": DOCUMENT_TYPE_LOOKUP[cat]["label"], "original_name": orig, "stored_name": stored, "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M")})
+    save_learner_document_store(store)
+    return jsonify({"ok": True, "message": f"{DOCUMENT_TYPE_LOOKUP[cat]['label']} uploaded successfully.", "documents": get_learner_documents(learner_id), "checklist": get_document_checklist(learner_id)})
+
+@app.route("/learners/<learner_id>/documents/files/<filename>")
+def learner_document_file(learner_id, filename):
+    if not current_admin() and not current_student(): return redirect(url_for("login"))
+    as_attachment = request.args.get("download") == "1"
+    return send_from_directory(os.path.join(LEARNER_UPLOADS_DIR, str(learner_id)), filename, as_attachment=as_attachment)
+
+@app.route("/documents/upload", methods=["POST"])
+@admin_required
+def upload_central_document():
+    name = request.form.get("name", "").strip()
+    file = request.files.get("document_file")
+    if not name or not file or not file.filename:
+        return jsonify({"ok": False, "message": "Please complete name and select a file."}), 400
+    if not is_allowed_document(file.filename):
+        return jsonify({"ok": False, "message": "Invalid file type."}), 400
+    orig = secure_filename(file.filename)
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    stored = f"{ts}_{orig}"
+    file.save(os.path.join(CENTRAL_UPLOADS_DIR, stored))
+    docs = load_central_document_store()
+    docs.insert(0, {"id": f"DOC-{ts}", "name": name, "stored_name": stored, "updated": datetime.now().strftime("%Y-%m-%d %H:%M"), "status": "Current"})
+    save_central_document_store(docs)
+    return jsonify({"ok": True, "documents": docs})
+
+@app.errorhandler(413)
+def file_too_large(_):
+    return jsonify({"ok": False, "message": f"File too large. Max {MAX_DOCUMENT_MB} MB."}), 413
+
+
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MESSAGING SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_messages(): return load_json(MESSAGES_FILE, [])
+def save_messages(m): save_json(MESSAGES_FILE, m)
+def load_meet_rooms(): return load_json(MEET_ROOMS_FILE, {})
+def save_meet_rooms(r): save_json(MEET_ROOMS_FILE, r)
+
+def get_caller_identity():
+    admin = current_admin()
+    if admin:
+        return {"id": f"admin::{session.get('admin_email')}", "name": admin["name"], "role": "admin"}
+    student = current_student()
+    if student:
+        return {"id": f"student::{student['id']}", "name": student["full_name"], "role": "student"}
+    return None
+
+def get_all_contacts(caller):
+    contacts = []
+    if caller["role"] == "admin":
+        for s in load_students():
+            contacts.append({"id": f"student::{s['id']}", "name": s["full_name"], "sub": s.get("student_number",""), "role": "student"})
+        for email, a in ADMIN_USERS.items():
+            cid = f"admin::{email}"
+            if cid != caller["id"]:
+                contacts.append({"id": cid, "name": a["name"], "sub": a["role_label"], "role": "admin"})
+    else:
+        for email, a in ADMIN_USERS.items():
+            contacts.append({"id": f"admin::{email}", "name": a["name"], "sub": a["role_label"], "role": "admin"})
+    return contacts
+
+def get_thread_key(id_a, id_b):
+    ids = sorted([id_a, id_b])
+    return f"{ids[0]}||{ids[1]}"
+
+def get_thread_messages(caller_id, other_id):
+    key = get_thread_key(caller_id, other_id)
+    all_msgs = load_messages()
+    return [m for m in all_msgs if m.get("thread") == key]
+
+def get_unread_count(caller_id):
+    all_msgs = load_messages()
+    return sum(1 for m in all_msgs if m.get("to_id") == caller_id and not m.get("read"))
+
+MSG_PAGE_CSS = """
+.msg-layout{display:flex;height:calc(100vh - 60px - 56px);overflow:hidden;gap:0;margin:-28px -28px -48px;border-top:1px solid var(--border)}
+.msg-contacts{width:300px;flex-shrink:0;border-right:1px solid var(--border);background:var(--surface);display:flex;flex-direction:column;overflow:hidden}
+.msg-contacts-header{padding:16px;border-bottom:1px solid var(--border);font-family:'Syne',sans-serif;font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px}
+.msg-search{padding:10px 14px;border-bottom:1px solid var(--border)}
+.msg-search input{width:100%;background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:13px;color:var(--text);outline:none}
+.msg-search input:focus{border-color:var(--jh-teal)}
+.msg-contact-list{flex:1;overflow-y:auto}
+.msg-contact-item{display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;border-bottom:1px solid var(--border);transition:background .15s;position:relative}
+.msg-contact-item:hover{background:var(--surface-2)}
+.msg-contact-item.active{background:rgba(0,168,157,.1);border-left:3px solid var(--jh-teal)}
+.msg-contact-avatar{width:38px;height:38px;border-radius:50%;background:var(--jh-grad);display:flex;align-items:center;justify-content:center;font-family:'Syne',sans-serif;font-weight:700;font-size:13px;color:#fff;flex-shrink:0}
+.msg-contact-info{flex:1;min-width:0}
+.msg-contact-name{font-size:13.5px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.msg-contact-sub{font-size:11px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.msg-contact-preview{font-size:11.5px;color:var(--text-2);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.unread-badge{background:var(--jh-teal);color:#fff;font-size:10px;font-weight:700;padding:2px 6px;border-radius:20px;min-width:18px;text-align:center}
+
+.msg-chat{flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+.msg-chat-header{padding:14px 18px;border-bottom:1px solid var(--border);background:var(--surface);display:flex;align-items:center;gap:12px}
+.msg-chat-title{font-family:'Syne',sans-serif;font-weight:700;font-size:15px;color:var(--text);flex:1}
+.msg-chat-sub{font-size:12px;color:var(--text-3)}
+.msg-meet-btn{background:var(--jh-grad);color:#fff;border:none;border-radius:8px;padding:7px 14px;font-size:12.5px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:6px;transition:opacity .2s}
+.msg-meet-btn:hover{opacity:.85}
+
+.msg-body{flex:1;overflow-y:auto;padding:20px 18px;display:flex;flex-direction:column;gap:10px}
+.msg-body::-webkit-scrollbar{width:4px}
+.msg-body::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+
+.msg-bubble-row{display:flex;align-items:flex-end;gap:8px}
+.msg-bubble-row.mine{flex-direction:row-reverse}
+.msg-bubble-avatar{width:28px;height:28px;border-radius:50%;background:var(--jh-grad);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:#fff;flex-shrink:0}
+.msg-bubble{max-width:65%;padding:10px 14px;border-radius:16px;font-size:13.5px;line-height:1.5;word-break:break-word}
+.msg-bubble.theirs{background:var(--surface);border:1px solid var(--border);color:var(--text);border-bottom-left-radius:4px}
+.msg-bubble.mine{background:var(--jh-grad);color:#fff;border-bottom-right-radius:4px}
+.msg-meta{font-size:10px;color:var(--text-3);margin-top:3px;text-align:right}
+.msg-bubble.theirs + .msg-meta{text-align:left}
+
+.msg-footer{padding:12px 18px;border-top:1px solid var(--border);background:var(--surface);display:flex;gap:10px;align-items:flex-end}
+.msg-input{flex:1;background:var(--bg-2);border:1.5px solid var(--border);border-radius:12px;padding:10px 14px;font-size:13.5px;color:var(--text);outline:none;resize:none;font-family:'DM Sans',sans-serif;line-height:1.4;max-height:120px;overflow-y:auto;transition:border-color .2s}
+.msg-input:focus{border-color:var(--jh-teal)}
+.msg-send-btn{background:var(--jh-grad);color:#fff;border:none;border-radius:10px;width:40px;height:40px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:opacity .2s}
+.msg-send-btn:hover{opacity:.85}
+.msg-send-btn:disabled{opacity:.4;cursor:not-allowed}
+
+.msg-empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--text-3);gap:10px}
+.msg-empty-icon{font-size:48px;opacity:.4}
+.msg-date-divider{text-align:center;font-size:11px;color:var(--text-3);padding:4px 0;display:flex;align-items:center;gap:8px}
+.msg-date-divider::before,.msg-date-divider::after{content:'';flex:1;height:1px;background:var(--border)}
+"""
+
+def _messages_page(sidebar_fn, sidebar_path, base_route):
+    caller = get_caller_identity()
+    contacts = get_all_contacts(caller)
+    all_msgs = load_messages()
+
+    # Build contact list with last message preview and unread count
+    contact_items_html = ""
+    for c in contacts:
+        key = get_thread_key(caller["id"], c["id"])
+        thread = [m for m in all_msgs if m.get("thread") == key]
+        last = thread[-1] if thread else None
+        unread = sum(1 for m in thread if m.get("to_id") == caller["id"] and not m.get("read"))
+        preview = (last["body"][:40] + "…") if last and len(last.get("body","")) > 40 else (last["body"] if last else "No messages yet")
+        initials = "".join(w[0].upper() for w in c["name"].split()[:2])
+        badge = f'<span class="unread-badge">{unread}</span>' if unread else ""
+        role_icon = "👤" if c["role"] == "student" else "⚙️"
+        safe_name = c["name"].replace("'", "&#39;")
+        safe_id = c["id"].replace(":", "_").replace(".", "_")
+        contact_items_html += f"""
+<div class="msg-contact-item" onclick="openThread('{c['id']}', '{safe_name}', '{c['sub']}')" id="contact-{safe_id}">
+  <div class="msg-contact-avatar">{initials}</div>
+  <div class="msg-contact-info">
+    <div class="msg-contact-name">{role_icon} {c['name']}</div>
+    <div class="msg-contact-sub">{c['sub']}</div>
+    <div class="msg-contact-preview" id="preview-{safe_id}">{preview}</div>
+  </div>
+  {badge}
+</div>"""
+
+    content = f"""
+<style>{MSG_PAGE_CSS}</style>
+<div class="msg-layout">
+  <div class="msg-contacts">
+    <div class="msg-contacts-header">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      Messages
+    </div>
+    <div class="msg-search"><input type="text" placeholder="Search contacts…" oninput="filterContacts(this.value)"></div>
+    <div class="msg-contact-list" id="contactList">{contact_items_html}</div>
+  </div>
+
+  <div class="msg-chat" id="chatPanel">
+    <div class="msg-empty" id="chatEmpty">
+      <div class="msg-empty-icon">💬</div>
+      <div style="font-size:15px;font-weight:600;color:var(--text-2)">Select a conversation</div>
+      <div style="font-size:13px">Choose a contact from the left to start messaging</div>
+    </div>
+
+    <div id="chatActive" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+      <div class="msg-chat-header">
+        <div class="msg-contact-avatar" id="chatAvatar" style="width:36px;height:36px;font-size:12px"></div>
+        <div style="flex:1">
+          <div class="msg-chat-title" id="chatName">–</div>
+          <div class="msg-chat-sub" id="chatSub">–</div>
+        </div>
+      </div>
+      <div class="msg-body" id="msgBody"></div>
+      <div class="msg-footer">
+        <textarea class="msg-input" id="msgInput" placeholder="Type a message…" rows="1"
+          onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();sendMsg()}}"
+          oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"></textarea>
+        <button class="msg-send-btn" id="sendBtn" onclick="sendMsg()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const MY_ID = '{caller["id"]}';
+const MY_NAME = '{caller["name"]}';
+let activeContactId = null;
+let activeContactName = null;
+let pollTimer = null;
+
+function filterContacts(q) {{
+  document.querySelectorAll('.msg-contact-item').forEach(el => {{
+    const name = el.querySelector('.msg-contact-name').textContent.toLowerCase();
+    el.style.display = name.includes(q.toLowerCase()) ? '' : 'none';
+  }});
+}}
+
+function openThread(contactId, contactName, contactSub) {{
+  activeContactId = contactId;
+  activeContactName = contactName;
+  document.getElementById('chatEmpty').style.display = 'none';
+  const ca = document.getElementById('chatActive');
+  ca.style.display = 'flex';
+  ca.style.flexDirection = 'column';
+  document.getElementById('chatName').textContent = contactName;
+  document.getElementById('chatSub').textContent = contactSub;
+  const initials = contactName.split(' ').slice(0,2).map(w=>w[0]?.toUpperCase()||'').join('');
+  document.getElementById('chatAvatar').textContent = initials;
+  document.querySelectorAll('.msg-contact-item').forEach(el => el.classList.remove('active'));
+  const cid = contactId.replace(/:/g,'_').replace(/\\./g,'_');
+  const el = document.getElementById('contact-'+cid);
+  if(el) el.classList.add('active');
+  loadMessages(true);
+  clearInterval(pollTimer);
+  pollTimer = setInterval(() => loadMessages(false), 3000);
+  document.getElementById('msgInput').focus();
+}}
+
+async function loadMessages(scroll) {{
+  if(!activeContactId) return;
+  const res = await fetch('/api/messages/thread?with='+encodeURIComponent(activeContactId));
+  const data = await res.json();
+  if(!data.ok) return;
+  renderMessages(data.messages, scroll);
+  // Mark read
+  await fetch('/api/messages/read', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{from_id:activeContactId}})}});
+}}
+
+function renderMessages(msgs, scroll) {{
+  const body = document.getElementById('msgBody');
+  body.innerHTML = '';
+  let lastDate = '';
+  msgs.forEach(m => {{
+    const d = new Date(m.ts * 1000);
+    const dateStr = d.toLocaleDateString('en-ZA', {{weekday:'short',month:'short',day:'numeric'}});
+    if(dateStr !== lastDate) {{
+      lastDate = dateStr;
+      const div = document.createElement('div');
+      div.className = 'msg-date-divider';
+      div.textContent = dateStr;
+      body.appendChild(div);
+    }}
+    const mine = m.from_id === MY_ID;
+    const initials = m.from_name.split(' ').slice(0,2).map(w=>w[0]?.toUpperCase()||'').join('');
+    const row = document.createElement('div');
+    row.className = 'msg-bubble-row' + (mine ? ' mine' : '');
+    const time = d.toLocaleTimeString('en-ZA', {{hour:'2-digit',minute:'2-digit'}});
+    row.innerHTML = `
+      <div class="msg-bubble-avatar">${{initials}}</div>
+      <div>
+        <div class="msg-bubble ${{mine?'mine':'theirs'}}">${{escHtml(m.body)}}</div>
+        <div class="msg-meta">${{time}}</div>
+      </div>`;
+    body.appendChild(row);
+  }});
+  if(scroll) body.scrollTop = body.scrollHeight;
+}}
+
+function escHtml(s) {{
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\\n/g,'<br>');
+}}
+
+async function sendMsg() {{
+  const inp = document.getElementById('msgInput');
+  const body = inp.value.trim();
+  if(!body || !activeContactId) return;
+  inp.value = '';
+  inp.style.height = 'auto';
+  document.getElementById('sendBtn').disabled = true;
+  const res = await fetch('/api/messages/send', {{
+    method: 'POST',
+    headers: {{'Content-Type':'application/json'}},
+    body: JSON.stringify({{to_id: activeContactId, body}})
+  }});
+  const data = await res.json();
+  document.getElementById('sendBtn').disabled = false;
+  if(data.ok) {{
+    loadMessages(true);
+    // Update preview
+    const cid = activeContactId.replace(/:/g,'_').replace(/\\./g,'_');
+    const prev = document.getElementById('preview-'+cid);
+    if(prev) prev.textContent = body.length > 40 ? body.substring(0,40)+'…' : body;
+  }}
+}}
+
+</script>
+"""
+    return render_shell(content, "Messages", sidebar_fn(sidebar_path), "Messages")
+
+
+@app.route("/student/messages")
+@student_required
+def student_messages():
+    return _messages_page(student_sidebar, "/student/messages", "/student/messages")
+
+@app.route("/admin/messages")
+@admin_required
+def admin_messages():
+    return _messages_page(admin_sidebar, "/admin/messages", "/admin/messages")
+
+
+# ── Messaging API ────────────────────────────────────────────────────────────
+
+@app.route("/api/messages/thread")
+def api_messages_thread():
+    caller = get_caller_identity()
+    if not caller: return jsonify({"ok": False}), 401
+    other_id = request.args.get("with", "")
+    if not other_id: return jsonify({"ok": False, "error": "Missing param"}), 400
+    msgs = get_thread_messages(caller["id"], other_id)
+    return jsonify({"ok": True, "messages": msgs})
+
+@app.route("/api/messages/send", methods=["POST"])
+def api_messages_send():
+    caller = get_caller_identity()
+    if not caller: return jsonify({"ok": False}), 401
+    data = request.get_json(force=True) or {}
+    to_id = data.get("to_id", "").strip()
+    body = data.get("body", "").strip()
+    if not to_id or not body: return jsonify({"ok": False, "error": "Missing fields"}), 400
+    all_msgs = load_messages()
+    msg = {
+        "id": f"msg-{int(datetime.now().timestamp()*1000)}",
+        "thread": get_thread_key(caller["id"], to_id),
+        "from_id": caller["id"],
+        "from_name": caller["name"],
+        "to_id": to_id,
+        "body": body,
+        "ts": int(datetime.now().timestamp()),
+        "read": False
+    }
+    all_msgs.append(msg)
+    save_messages(all_msgs)
+    return jsonify({"ok": True, "msg": msg})
+
+@app.route("/api/messages/read", methods=["POST"])
+def api_messages_read():
+    caller = get_caller_identity()
+    if not caller: return jsonify({"ok": False}), 401
+    data = request.get_json(force=True) or {}
+    from_id = data.get("from_id", "")
+    all_msgs = load_messages()
+    changed = False
+    for m in all_msgs:
+        if m.get("to_id") == caller["id"] and m.get("from_id") == from_id and not m.get("read"):
+            m["read"] = True
+            changed = True
+    if changed: save_messages(all_msgs)
+    return jsonify({"ok": True})
+
+@app.route("/api/messages/unread")
+def api_messages_unread():
+    caller = get_caller_identity()
+    if not caller: return jsonify({"ok": False}), 401
+    count = get_unread_count(caller["id"])
+    return jsonify({"ok": True, "count": count})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MEET ROOM API  (code-based access)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@admin_required
+def api_meet_create():
+    caller = get_caller_identity()
+    data = request.get_json(force=True) or {}
+    title = data.get("title", "").strip()
+    room = create_meet_room(title, caller["name"] if caller else "Admin")
+    return jsonify({"ok": True, "room": room})
+
+def api_meet_join():
+    caller = get_caller_identity()
+    if not caller:
+        return jsonify({"ok": False, "error": "Not logged in"}), 401
+    data = request.get_json(force=True) or {}
+    code = data.get("code", "").strip().upper()
+    if not code:
+        return jsonify({"ok": False, "error": "No code provided"}), 400
+    room = get_room_by_code(code)
+    if not room:
+        return jsonify({"ok": False, "error": "Invalid code"}), 404
+    if not room.get("active"):
+        return jsonify({"ok": False, "error": "This meeting has ended"}), 410
+    return jsonify({"ok": True, "room": room})
+
+@admin_required
+def api_meet_end():
+    data = request.get_json(force=True) or {}
+    code = data.get("code", "").strip().upper()
+    rooms = load_meet_rooms()
+    if code in rooms:
+        rooms[code]["active"] = False
+        save_meet_rooms(rooms)
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "Room not found"}), 404
+
+@admin_required
+def api_meet_rooms():
+    rooms = load_meet_rooms()
+    active = [r for r in rooms.values() if r.get("active")]
+    active.sort(key=lambda r: r.get("created_at", 0), reverse=True)
+    return jsonify({"ok": True, "rooms": active})
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VIDEO MEET (Jitsi Meet — camera & mic work on any HTTPS connection)
+# ══════════════════════════════════════════════════════════════════════════════
+
+MEET_PAGE_CSS = """
+.meet-shell{min-height:100vh;background:#0a0a0a;display:flex;flex-direction:column;font-family:'DM Sans',sans-serif;color:#fff;margin:-28px -28px -48px}
+.meet-topbar{height:56px;background:#111;border-bottom:1px solid #222;display:flex;align-items:center;padding:0 20px;gap:14px;flex-shrink:0}
+.meet-topbar-title{font-family:'Syne',sans-serif;font-weight:700;font-size:15px;color:#fff;flex:1}
+
+.meet-lobby{flex:1;display:flex;align-items:center;justify-content:center;padding:40px}
+.meet-lobby-card{background:#111;border:1px solid #222;border-radius:16px;padding:36px;max-width:460px;width:100%;text-align:center}
+.meet-room-input{width:100%;background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:11px 14px;color:#fff;font-size:13.5px;outline:none;font-family:'DM Sans',sans-serif;text-align:center;margin-bottom:12px;box-sizing:border-box}
+.meet-room-input:focus{border-color:#00A89D}
+.meet-join-btn{width:100%;background:linear-gradient(135deg,#8DC63F,#00A89D);color:#fff;border:none;border-radius:10px;padding:13px;font-size:14px;font-weight:700;cursor:pointer;font-family:'Syne',sans-serif;transition:opacity .2s;margin-bottom:8px}
+.meet-join-btn:hover{opacity:.88}
+.meet-hint{font-size:11px;color:#555;margin-top:8px;line-height:1.5}
+
+.meet-active{flex:1;display:none;flex-direction:column}
+.meet-active.shown{display:flex}
+.meet-active-bar{height:48px;background:#111;border-bottom:1px solid #222;display:flex;align-items:center;padding:0 16px;gap:12px;flex-shrink:0}
+.meet-room-badge{font-size:12px;color:#888;background:#1a1a1a;border:1px solid #333;border-radius:6px;padding:3px 10px;cursor:pointer;transition:background .2s}
+.meet-room-badge:hover{background:#222;color:#00A89D}
+.meet-frame-wrap{flex:1;position:relative;overflow:hidden}
+.meet-frame-wrap iframe{position:absolute;inset:0;width:100%;height:100%;border:none}
+"""
+
+def _admin_meet_page(sidebar_fn, sidebar_path, base_route):
+    caller = get_caller_identity()
+    user_name = caller["name"].replace("'", "\\'") if caller else "Admin"
+    back_url = base_route.replace("/meet", "/messages")
+    content = f"""
+<style>
+:root{{--jh-grad:linear-gradient(135deg,#8DC63F 0%,#00A89D 60%,#2D6A4F 100%)}}
+{MEET_PAGE_CSS}
+.meet-code-badge{{
+  display:inline-block;font-size:32px;font-weight:800;letter-spacing:.18em;
+  font-family:'Syne',sans-serif;color:#fff;background:#1a1a1a;
+  border:2px solid #00A89D;border-radius:12px;padding:14px 28px;
+  text-align:center;cursor:pointer;transition:background .2s;user-select:all;
+}}
+.meet-code-badge:hover{{background:#222}}
+.meet-code-hint{{font-size:11.5px;color:#555;margin-top:10px;line-height:1.6}}
+.meet-create-form{{display:flex;gap:8px;margin-bottom:16px;width:100%}}
+.meet-create-form input{{flex:1;background:#1a1a1a;border:1px solid #333;border-radius:8px;
+  padding:10px 14px;color:#fff;font-size:13px;outline:none;font-family:'DM Sans',sans-serif}}
+.meet-create-form input:focus{{border-color:#00A89D}}
+.meet-create-btn{{background:var(--jh-grad);color:#fff;border:none;border-radius:8px;
+  padding:10px 20px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap;
+  font-family:'Syne',sans-serif;transition:opacity .2s}}
+.meet-create-btn:hover{{opacity:.85}}
+.meet-active-rooms{{margin-top:16px;width:100%;text-align:left}}
+.meet-room-row{{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;
+  padding:10px 14px;margin-bottom:8px;display:flex;align-items:center;gap:10px}}
+.meet-room-row-code{{font-family:'Syne',sans-serif;font-weight:800;font-size:18px;
+  letter-spacing:.12em;color:#00A89D;min-width:70px}}
+.meet-room-row-title{{flex:1;font-size:13px;color:#ccc}}
+.meet-room-row-btn{{background:none;border:1px solid #333;border-radius:6px;
+  color:#888;font-size:11px;padding:4px 10px;cursor:pointer;transition:all .2s}}
+.meet-room-row-btn:hover{{border-color:#00A89D;color:#00A89D}}
+.meet-room-row-end{{background:none;border:1px solid #333;border-radius:6px;
+  color:#888;font-size:11px;padding:4px 10px;cursor:pointer;transition:all .2s}}
+.meet-room-row-end:hover{{border-color:#dc3535;color:#dc3535}}
+</style>
+<div class="meet-shell" id="meetShell">
+
+  <div class="meet-topbar">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#00A89D" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+    <span class="meet-topbar-title">JH Meet — Admin</span>
+    <a href="{back_url}" style="font-size:12px;color:#666;text-decoration:none;padding:4px 10px;background:#1a1a1a;border:1px solid #333;border-radius:6px;transition:color .2s" onmouseover="this.style.color='#00A89D'" onmouseout="this.style.color='#666'">← Back</a>
+  </div>
+
+  <!-- Lobby -->
+  <div class="meet-lobby" id="lobbyPanel">
+    <div class="meet-lobby-card" style="max-width:520px">
+      <div style="font-size:48px;margin-bottom:16px">📹</div>
+      <h2 style="font-family:'Syne',sans-serif;font-size:22px;font-weight:800;margin-bottom:8px">Start a Meeting</h2>
+      <p style="color:#888;font-size:13px;margin-bottom:24px">Create a meeting and share the join code with students.</p>
+
+      <div class="meet-create-form">
+        <input id="meetingTitle" type="text" placeholder="Meeting title (optional)">
+        <button class="meet-create-btn" onclick="createMeeting()">🎥 Create</button>
+      </div>
+
+      <!-- Rejoin existing meeting -->
+      <div style="margin-bottom:20px;width:100%">
+        <button onclick="toggleRejoinInput()" id="rejoinToggleBtn"
+          style="width:100%;background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:10px 16px;color:#aaa;font-size:13px;font-weight:600;cursor:pointer;font-family:'DM Sans',sans-serif;transition:all .2s;text-align:left;display:flex;align-items:center;gap:8px"
+          onmouseover="this.style.borderColor='#00A89D';this.style.color='#00A89D'"
+          onmouseout="this.style.borderColor='#333';this.style.color='#aaa'">
+          <span>↩</span> Rejoin Existing Meeting
+        </button>
+        <div id="rejoinInputArea" style="display:none;margin-top:8px;background:#111;border:1px solid #2a2a2a;border-radius:8px;padding:14px">
+          <p style="color:#666;font-size:11.5px;margin:0 0 10px;text-transform:uppercase;letter-spacing:.07em">Enter the meeting code</p>
+          <div style="display:flex;gap:8px">
+            <input id="rejoinCodeInput" type="text" maxlength="6" placeholder="e.g. A1B2C3"
+              style="flex:1;background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:10px 14px;color:#fff;font-size:18px;font-weight:800;letter-spacing:.18em;text-transform:uppercase;outline:none;font-family:'Syne',sans-serif"
+              oninput="this.value=this.value.toUpperCase()"
+              onkeydown="if(event.key==='Enter')rejoinByCode()"
+              onfocus="this.style.borderColor='#00A89D'" onblur="this.style.borderColor='#333'">
+            <button onclick="rejoinByCode()"
+              style="background:linear-gradient(135deg,#8DC63F,#00A89D);color:#fff;border:none;border-radius:8px;padding:10px 20px;font-size:13px;font-weight:700;cursor:pointer;font-family:'Syne',sans-serif;white-space:nowrap">
+              Join →
+            </button>
+          </div>
+          <div id="rejoinCodeError" style="color:#dc3535;font-size:12px;margin-top:8px;min-height:16px"></div>
+        </div>
+      </div>
+
+      <!-- Code display -->
+      <div id="codeArea" style="display:none;margin-bottom:20px">
+        <p style="color:#aaa;font-size:12px;margin-bottom:8px">Share this code with students:</p>
+        <div class="meet-code-badge" id="codeBadge" onclick="copyCode()" title="Click to copy">------</div>
+        <div class="meet-code-hint">Click the code to copy it &nbsp;·&nbsp; Students enter it on their Meet page</div>
+        <button onclick="joinAsAdmin()" style="margin-top:16px;background:var(--jh-grad);color:#fff;border:none;border-radius:10px;padding:12px 28px;font-size:14px;font-weight:700;cursor:pointer;font-family:'Syne',sans-serif;transition:opacity .2s">
+          Enter Meeting →
+        </button>
+      </div>
+
+      <!-- Active rooms -->
+      <div class="meet-active-rooms" id="activeRooms"></div>
+
+      <!-- Rejoin last meeting banner -->
+      <div id="rejoinBanner" style="display:none;margin-top:16px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:10px;padding:14px 18px;width:100%;box-sizing:border-box">
+        <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Last meeting</div>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span id="rejoinTitle" style="flex:1;font-size:13.5px;color:#ccc;min-width:80px"></span>
+          <span id="rejoinCode" style="font-family:'Syne',sans-serif;font-weight:800;font-size:16px;letter-spacing:.12em;color:#00A89D"></span>
+          <button onclick="doRejoin()"
+            style="background:linear-gradient(135deg,#8DC63F,#00A89D);color:#fff;border:none;border-radius:7px;padding:7px 16px;font-size:12px;font-weight:700;cursor:pointer;font-family:'Syne',sans-serif;white-space:nowrap">
+            ↩ Rejoin
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Active meeting -->
+  <div class="meet-active" id="meetingPanel">
+    <div class="meet-active-bar">
+      <span id="roomBadge" class="meet-room-badge" onclick="copyRoom()" title="Click to copy">Room: –</span>
+      <span id="codeLabel" style="font-size:12px;color:#666;margin-left:4px"></span>
+      <span style="flex:1"></span>
+      <button onclick="endMeeting()" style="background:#dc3535;color:#fff;border:none;border-radius:8px;padding:6px 16px;font-size:13px;font-weight:600;cursor:pointer;font-family:'DM Sans',sans-serif;margin-right:8px">End Meeting</button>
+      <button onclick="leaveMeet()" style="background:#333;color:#fff;border:none;border-radius:8px;padding:6px 16px;font-size:13px;font-weight:600;cursor:pointer;font-family:'DM Sans',sans-serif">Leave</button>
+    </div>
+    <div class="meet-frame-wrap">
+      <iframe id="jitsiFrame" allow="camera; microphone; display-capture; fullscreen; autoplay" allowfullscreen></iframe>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const MY_NAME_MEET = '{user_name}';
+const BACK_URL = '{back_url}';
+let currentRoom = null;
+let currentCode = null;
+
+async function createMeeting() {{
+  const title = document.getElementById('meetingTitle').value.trim();
+  const res = await fetch('/api/meet/create', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{title}})
+  }});
+  const data = await res.json();
+  if (!data.ok) {{ alert('Could not create meeting.'); return; }}
+  currentCode = data.room.code;
+  currentRoom = data.room.jitsi_room;
+  document.getElementById('codeBadge').textContent = currentCode;
+  document.getElementById('codeArea').style.display = 'block';
+  loadActiveRooms();
+}}
+
+function copyCode() {{
+  const code = document.getElementById('codeBadge').textContent;
+  navigator.clipboard.writeText(code).then(() => {{
+    const b = document.getElementById('codeBadge');
+    const orig = b.textContent;
+    b.textContent = 'Copied ✓';
+    setTimeout(() => b.textContent = orig, 1800);
+  }});
+}}
+
+function joinAsAdmin() {{
+  if (!currentRoom) return;
+  document.getElementById('roomBadge').textContent = 'Room: ' + currentRoom;
+  document.getElementById('codeLabel').textContent = '· Code: ' + currentCode;
+  document.getElementById('lobbyPanel').style.display = 'none';
+  const panel = document.getElementById('meetingPanel');
+  panel.classList.add('shown');
+  const jitsiUrl = 'https://meet.jit.si/' + encodeURIComponent(currentRoom)
+    + '#userInfo.displayName="' + encodeURIComponent(MY_NAME_MEET) + '"'
+    + '&config.prejoinPageEnabled=false'
+    + '&config.startWithAudioMuted=false'
+    + '&config.startWithVideoMuted=false'
+    + '&interfaceConfig.SHOW_JITSI_WATERMARK=false'
+    + '&interfaceConfig.SHOW_BRAND_WATERMARK=false';
+  document.getElementById('jitsiFrame').src = jitsiUrl;
+}}
+
+async function endMeeting() {{
+  if (currentCode && confirm('End this meeting for everyone?')) {{
+    await fetch('/api/meet/end', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{code: currentCode}})
+    }});
+    leaveMeet();
+  }}
+}}
+
+function leaveMeet() {{
+  // Capture last room before clearing
+  const lastRoom = currentCode ? {{ code: currentCode, jitsiRoom: currentRoom, title: document.getElementById('roomBadge').textContent.replace('Room: ', '') }} : null;
+  document.getElementById('jitsiFrame').src = '';
+  document.getElementById('meetingPanel').classList.remove('shown');
+  document.getElementById('lobbyPanel').style.display = 'flex';
+  currentRoom = null; currentCode = null;
+  document.getElementById('codeArea').style.display = 'none';
+  document.getElementById('meetingTitle').value = '';
+  if (lastRoom) {{
+    document.getElementById('rejoinTitle').textContent = lastRoom.title;
+    document.getElementById('rejoinCode').textContent = lastRoom.code;
+    document.getElementById('rejoinBanner').style.display = 'block';
+    // Store for doRejoin
+    window._adminLastRoom = lastRoom;
+  }}
+  loadActiveRooms();
+}}
+
+function doRejoin() {{
+  const r = window._adminLastRoom;
+  if (!r) return;
+  currentCode = r.code;
+  currentRoom = r.jitsiRoom;
+  joinAsAdmin();
+}}
+
+function toggleRejoinInput() {{
+  const area = document.getElementById('rejoinInputArea');
+  const open = area.style.display === 'block';
+  area.style.display = open ? 'none' : 'block';
+  if (!open) document.getElementById('rejoinCodeInput').focus();
+}}
+
+async function rejoinByCode() {{
+  const code = document.getElementById('rejoinCodeInput').value.trim().toUpperCase();
+  document.getElementById('rejoinCodeError').textContent = '';
+  if (code.length !== 6) {{
+    document.getElementById('rejoinCodeError').textContent = 'Please enter the full 6-character code.';
+    return;
+  }}
+  const res = await fetch('/api/meet/join', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{code}})
+  }});
+  const data = await res.json();
+  if (!data.ok) {{
+    document.getElementById('rejoinCodeError').textContent = data.error || 'Invalid or expired code.';
+    return;
+  }}
+  currentCode = code;
+  currentRoom = data.room.jitsi_room;
+  document.getElementById('rejoinInputArea').style.display = 'none';
+  document.getElementById('rejoinCodeInput').value = '';
+  joinAsAdmin();
+}}
+
+function copyRoom() {{
+  if (!currentRoom) return;
+  navigator.clipboard.writeText(currentRoom);
+}}
+
+async function loadActiveRooms() {{
+  const res = await fetch('/api/meet/rooms');
+  const data = await res.json();
+  const el = document.getElementById('activeRooms');
+  if (!data.ok || !data.rooms.length) {{ el.innerHTML = ''; return; }}
+  el.innerHTML = '<p style="color:#555;font-size:11px;margin-bottom:8px;text-transform:uppercase;letter-spacing:.08em">Active Meetings</p>'
+    + data.rooms.map(r => `
+      <div class="meet-room-row">
+        <span class="meet-room-row-code">${{r.code}}</span>
+        <span class="meet-room-row-title">${{r.title}}</span>
+        <button class="meet-room-row-btn" onclick="rejoinRoom('${{r.code}}','${{r.jitsi_room}}')">Rejoin</button>
+        <button class="meet-room-row-end" onclick="endRoomByCode('${{r.code}}')">End</button>
+      </div>`).join('');
+}}
+
+function rejoinRoom(code, jitsiRoom) {{
+  currentCode = code; currentRoom = jitsiRoom;
+  joinAsAdmin();
+}}
+
+async function endRoomByCode(code) {{
+  if (!confirm('End this meeting?')) return;
+  await fetch('/api/meet/end', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{code}})
+  }});
+  loadActiveRooms();
+}}
+
+loadActiveRooms();
+</script>
+"""
+    return render_shell(content, "JH Meet", sidebar_fn(sidebar_path), "JH Meet")
+
+
+def _student_meet_page(sidebar_fn, sidebar_path, base_route):
+    caller = get_caller_identity()
+    user_name = caller["name"].replace("'", "\\'") if caller else "Guest"
+    back_url = base_route.replace("/meet", "/messages")
+    content = f"""
+<style>
+:root{{--jh-grad:linear-gradient(135deg,#8DC63F 0%,#00A89D 60%,#2D6A4F 100%)}}
+{MEET_PAGE_CSS}
+.meet-code-input{{
+  width:100%;background:#1a1a1a;border:2px solid #333;border-radius:10px;
+  padding:14px;color:#fff;font-size:28px;font-weight:800;letter-spacing:.18em;
+  font-family:'Syne',sans-serif;text-align:center;outline:none;
+  text-transform:uppercase;margin-bottom:12px;box-sizing:border-box;
+}}
+.meet-code-input:focus{{border-color:#00A89D}}
+.meet-code-error{{color:#dc3535;font-size:12.5px;margin-bottom:10px;min-height:18px}}
+</style>
+<div class="meet-shell" id="meetShell">
+
+  <div class="meet-topbar">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#00A89D" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+    <span class="meet-topbar-title">JH Meet</span>
+    <a href="{back_url}" style="font-size:12px;color:#666;text-decoration:none;padding:4px 10px;background:#1a1a1a;border:1px solid #333;border-radius:6px;transition:color .2s" onmouseover="this.style.color='#00A89D'" onmouseout="this.style.color='#666'">← Back</a>
+  </div>
+
+  <!-- Lobby -->
+  <div class="meet-lobby" id="lobbyPanel">
+    <div class="meet-lobby-card">
+      <div style="font-size:48px;margin-bottom:16px">📹</div>
+      <h2 style="font-family:'Syne',sans-serif;font-size:22px;font-weight:800;margin-bottom:8px">Join a Meeting</h2>
+      <p style="color:#888;font-size:13.5px;margin-bottom:24px">Enter the 6-character code from your moderator.</p>
+
+      <input id="codeInput" class="meet-code-input" type="text" maxlength="6"
+        placeholder="ABC123" autocomplete="off" spellcheck="false"
+        oninput="this.value=this.value.toUpperCase()"
+        onkeydown="if(event.key==='Enter')joinWithCode()">
+
+      <div class="meet-code-error" id="codeError"></div>
+
+      <button class="meet-join-btn" onclick="joinWithCode()">
+        🎥 &nbsp;Join Meeting
+      </button>
+
+      <!-- Rejoin banner — shown after leaving a meeting -->
+      <div id="rejoinBanner" style="display:none;margin-top:16px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:10px;padding:14px 16px;text-align:left">
+        <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Last meeting</div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span id="rejoinTitle" style="flex:1;font-size:13.5px;color:#ccc"></span>
+          <span id="rejoinCode" style="font-family:'Syne',sans-serif;font-weight:800;font-size:16px;letter-spacing:.12em;color:#00A89D"></span>
+          <button onclick="doRejoin()"
+            style="background:linear-gradient(135deg,#8DC63F,#00A89D);color:#fff;border:none;border-radius:7px;padding:7px 16px;font-size:12px;font-weight:700;cursor:pointer;font-family:'Syne',sans-serif;white-space:nowrap">
+            ↩ Rejoin
+          </button>
+        </div>
+      </div>
+
+      <div class="meet-hint">
+        Your moderator will share the code before the meeting starts.
+      </div>
+    </div>
+  </div>
+
+  <!-- Active meeting -->
+  <div class="meet-active" id="meetingPanel">
+    <div class="meet-active-bar">
+      <span id="roomBadge" class="meet-room-badge">In Meeting</span>
+      <span style="flex:1"></span>
+      <button onclick="leaveMeet()" style="background:#dc3535;color:#fff;border:none;border-radius:8px;padding:6px 16px;font-size:13px;font-weight:600;cursor:pointer;font-family:'DM Sans',sans-serif">Leave</button>
+    </div>
+    <div class="meet-frame-wrap">
+      <iframe id="jitsiFrame" allow="camera; microphone; display-capture; fullscreen; autoplay" allowfullscreen></iframe>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const MY_NAME_MEET = '{user_name}';
+let lastRoom = null;
+
+async function joinWithCode() {{
+  const code = document.getElementById('codeInput').value.trim().toUpperCase();
+  document.getElementById('codeError').textContent = '';
+  if (code.length !== 6) {{
+    document.getElementById('codeError').textContent = 'Please enter the full 6-character code.';
+    return;
+  }}
+  const res = await fetch('/api/meet/join', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{code}})
+  }});
+  const data = await res.json();
+  if (!data.ok) {{
+    document.getElementById('codeError').textContent = data.error || 'Invalid or expired code.';
+    return;
+  }}
+  lastRoom = {{ code, jitsiRoom: data.room.jitsi_room, title: data.room.title }};
+  launchMeeting(data.room.jitsi_room, data.room.title);
+}}
+
+function doRejoin() {{
+  if (!lastRoom) return;
+  launchMeeting(lastRoom.jitsiRoom, lastRoom.title);
+}}
+
+function launchMeeting(jitsiRoom, title) {{
+  document.getElementById('roomBadge').textContent = title;
+  document.getElementById('lobbyPanel').style.display = 'none';
+  document.getElementById('meetingPanel').classList.add('shown');
+  const jitsiUrl = 'https://meet.jit.si/' + encodeURIComponent(jitsiRoom)
+    + '#userInfo.displayName="' + encodeURIComponent(MY_NAME_MEET) + '"'
+    + '&config.prejoinPageEnabled=false'
+    + '&config.startWithAudioMuted=false'
+    + '&config.startWithVideoMuted=false'
+    + '&interfaceConfig.SHOW_JITSI_WATERMARK=false'
+    + '&interfaceConfig.SHOW_BRAND_WATERMARK=false';
+  document.getElementById('jitsiFrame').src = jitsiUrl;
+}}
+
+function leaveMeet() {{
+  document.getElementById('jitsiFrame').src = '';
+  document.getElementById('meetingPanel').classList.remove('shown');
+  document.getElementById('lobbyPanel').style.display = 'flex';
+  document.getElementById('codeInput').value = '';
+  if (lastRoom) {{
+    document.getElementById('rejoinTitle').textContent = lastRoom.title;
+    document.getElementById('rejoinCode').textContent = lastRoom.code;
+    document.getElementById('rejoinBanner').style.display = 'block';
+  }}
+}}
+</script>
+"""
+    return render_shell(content, "JH Meet", sidebar_fn(sidebar_path), "JH Meet")
+
+
+@student_required
+def student_meet():
+    return _student_meet_page(student_sidebar, "/student/meet", "/student/meet")
+
+@admin_required
+def admin_meet():
+    return _admin_meet_page(admin_sidebar, "/admin/meet", "/admin/meet")
+
+
+
+if __name__ == "__main__":
+    import threading, webbrowser, sys
+
+    use_https = "--https" in sys.argv
+
+    if use_https:
+        # Generate a self-signed cert so camera/mic work over HTTPS
+        import subprocess, os
+        cert_file = os.path.join(app.root_path, "cert.pem")
+        key_file  = os.path.join(app.root_path, "key.pem")
+        if not (os.path.exists(cert_file) and os.path.exists(key_file)):
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                "-keyout", key_file, "-out", cert_file,
+                "-days", "365", "-nodes",
+                "-subj", "/CN=localhost"
+            ], check=True)
+        ssl_context = (cert_file, key_file)
+        url = "https://localhost:5000"
+        threading.Timer(1.5, lambda: webbrowser.open(url)).start()
+        print(f"\n  Running with HTTPS — camera & microphone will work.")
+        print(f"  Open: {url}  (accept the self-signed certificate warning)\n")
+        app.run(host="0.0.0.0", port=5000, debug=False, ssl_context=ssl_context)
+    else:
+        url = "http://localhost:5000"
+        threading.Timer(1.5, lambda: webbrowser.open(url)).start()
+        print(f"\n  Running on HTTP.  Camera & microphone work on localhost.")
+        print(f"  For remote access with camera/mic, restart with:  python app.py --https\n")
+        app.run(host="0.0.0.0", port=5000, debug=False)

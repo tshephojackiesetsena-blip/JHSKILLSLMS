@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ group.name }} | Admin Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    {% include 'sidebar_admin.html' %}
+
+    <main class="ios-main">
+        <header class="ios-header">
+            <div class="ios-header-title">
+                <h1>Dashboard</h1>
+                <p>Welcome back, {{ current_user.name }}</p>
+            </div>
+        </header>
+
+        <div class="ios-hero">
+            <div class="ios-hero-content">
+                <h1>JH Student Services</h1>
+                <p>{{ group.tagline }}</p>
+            </div>
+        </div>
+
+        <div class="ios-stat-grid">
+            <div class="ios-stat-card blue">
+                <div class="ios-stat-icon blue">
+                    <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m13.5-9a2.5 2.5 0 11-5 0 2.5 2.5 0 015 0z"/></svg>
+                </div>
+                <div class="ios-stat-label">Students</div>
+                <div class="ios-stat-value">{{ dashboard_summary.student_number }}</div>
+            </div>
+            <div class="ios-stat-card green">
+                <div class="ios-stat-icon green">
+                    <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                </div>
+                <div class="ios-stat-label">Announcements</div>
+                <div class="ios-stat-value">{{ dashboard_summary.announcement_count }}</div>
+            </div>
+            <div class="ios-stat-card purple">
+                <div class="ios-stat-icon purple">
+                    <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+                </div>
+                <div class="ios-stat-label">Today's Classes</div>
+                <div class="ios-stat-value">{{ dashboard_summary.today_sessions }}</div>
+            </div>
+            <div class="ios-stat-card pink">
+                <div class="ios-stat-icon pink">
+                    <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                </div>
+                <div class="ios-stat-label">Fee Balance</div>
+                <div class="ios-stat-value">{{ dashboard_summary.balance }}</div>
+            </div>
+        </div>
+
+        <div class="ios-grid-2">
+            <div class="card">
+                <div style="margin-bottom: 20px;">
+                    <span class="badge badge-blue">Core Navigation</span>
+                    <h2 style="margin-top: 8px; font-size: 20px;">Start Here</h2>
+                </div>
+                <div class="ios-grid-2" style="gap: 12px;">
+                    {% for item in core_links %}
+                    <a href="{{ url_for(item.route) }}" class="card" style="text-decoration: none; display: block;">
+                        <strong style="color: var(--ios-blue);">{{ item.title }}</strong>
+                        <p style="font-size: 13px; color: var(--text-secondary); margin-top: 4px;">{{ item.detail }}</p>
+                    </a>
+                    {% endfor %}
+                </div>
+            </div>
+
+            <div class="card">
+                <div style="margin-bottom: 20px;">
+                    <span class="badge badge-purple">Announcements</span>
+                    <h2 style="margin-top: 8px; font-size: 20px;">Latest Notices</h2>
+                </div>
+                {% for item in announcements %}
+                <div style="padding: 12px; border-radius: 12px; background: var(--bg-glass-dark); margin-bottom: 8px;">
+                    <small style="color: var(--text-tertiary);">{{ item.category }} | {{ item.date }}</small>
+                    <strong style="display: block; margin-top: 4px;">{{ item.title }}</strong>
+                    <p style="font-size: 13px; color: var(--text-secondary); margin-top: 4px;">{{ item.summary }}</p>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+
+        <div style="margin-top: 24px;" class="card">
+            <div style="margin-bottom: 20px;">
+                <span class="badge badge-green">Finances</span>
+                <h2 style="margin-top: 8px; font-size: 20px;">Fee Account Summary</h2>
+            </div>
+            <div style="display: flex; gap: 32px; flex-wrap: wrap;">
+                <div>
+                    <small style="color: var(--text-tertiary);">Balance</small>
+                    <strong style="display: block; font-size: 24px;">{{ fee_account.tuition_balance }}</strong>
+                </div>
+                <div>
+                    <small style="color: var(--text-tertiary);">Next Payment Due</small>
+                    <strong style="display: block;">{{ fee_account.next_payment_due }}</strong>
+                </div>
+                <div>
+                    <small style="color: var(--text-tertiary);">Bursary Status</small>
+                    <strong style="display: block;">{{ fee_account.bursary_status }}</strong>
+                </div>
+            </div>
+            <a href="{{ url_for('fees') }}" class="btn btn-primary" style="margin-top: 16px; display: inline-block;">Open Full Fee Account</a>
+        </div>
+    </main>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

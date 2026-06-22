@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JH Admin | Student Registration</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    {% include 'sidebar_admin.html' %}
+
+    <main class="ios-main">
+        <header class="ios-header">
+            <div class="ios-header-title">
+                <h1>Student Registration</h1>
+                <p>Register students, issue portal login details, and manage access.</p>
+            </div>
+        </header>
+
+        <div class="ios-hero" style="padding: 32px;">
+            <div class="ios-hero-content">
+                <h1 style="font-size: 28px;">Create Student Portal Access</h1>
+                <p>Once registered, students use their own portal login and no longer need admin access.</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <div id="formMessage" class="message-box"></div>
+
+            <form id="studentRegisterForm">
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px;">
+                    <input class="input" name="full_name" placeholder="Full Name" required>
+                    <input class="input" name="email" type="email" placeholder="Email" required>
+                    <input class="input" name="phone" placeholder="Phone Number" required>
+                    <input class="input" name="id_number" placeholder="ID Number" required>
+                    <input class="input" name="gender" placeholder="Gender" required>
+                    <input class="input" name="address" placeholder="Address" required>
+                    <input class="input" name="employment" placeholder="Employment" required>
+                    <input class="input" name="qualification" placeholder="Qualification" required>
+                    <input class="input" name="faculty" placeholder="Faculty" required>
+                    <input class="input" name="programme" placeholder="Programme" required>
+                    <input class="input" name="coordinator" placeholder="Coordinator" required>
+                    <input class="input" name="location" placeholder="Campus / Location" required>
+                    <input class="input" name="start_date" type="date" required>
+                    <select class="input" name="status" required>
+                        <option value="Active">Active</option>
+                        <option value="Pending">Pending</option>
+                    </select>
+                    <input class="input" name="year_level" placeholder="Year Level" required>
+                    <input class="input" name="modules" placeholder="Modules (comma separated)" required>
+                    <input class="input" name="emergency_contact_name" placeholder="Emergency Contact Name" required>
+                    <input class="input" name="emergency_contact_phone" placeholder="Emergency Contact Phone" required>
+                    <input class="input" name="emergency_contact_relationship" placeholder="Emergency Relationship" required>
+                    <input class="input" name="tuition_balance" placeholder="Tuition Balance e.g. R18,450">
+                    <input class="input" name="bursary_status" placeholder="Bursary Status">
+                </div>
+
+                <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-top: 16px;">
+                    <button type="submit" class="btn btn-primary">Register Student</button>
+                    <a href="{{ url_for('student_login') }}" class="btn btn-secondary">Open Student Login</a>
+                </div>
+            </form>
+
+            <div class="ios-grid-3" style="margin-top: 24px; gap: 16px;">
+                <div class="card" style="padding: 16px;">
+                    <small class="ios-stat-label">Latest Username</small>
+                    <h3 id="latestUsername" style="font-size: 18px; margin-top: 8px;">Not issued yet</h3>
+                </div>
+                <div class="card" style="padding: 16px;">
+                    <small class="ios-stat-label">Latest Password</small>
+                    <h3 id="latestPassword" style="font-size: 18px; margin-top: 8px;">Not issued yet</h3>
+                </div>
+                <div class="card" style="padding: 16px;">
+                    <small class="ios-stat-label">Portal Route</small>
+                    <h3 style="font-size: 18px; margin-top: 8px;">/student-login</h3>
+                </div>
+            </div>
+
+            <div class="ios-stat-grid" style="margin-top: 24px;">
+                <div class="ios-stat-card blue">
+                    <div class="ios-stat-label">Total Students</div>
+                    <div class="ios-stat-value" id="totalStudents">{{ students|length }}</div>
+                </div>
+                <div class="ios-stat-card green">
+                    <div class="ios-stat-label">Active Accounts</div>
+                    <div class="ios-stat-value" id="activeStudents">{{ students | selectattr('status', 'equalto', 'Active') | list | length }}</div>
+                </div>
+                <div class="ios-stat-card purple">
+                    <div class="ios-stat-label">Registered</div>
+                    <div class="ios-stat-value" id="registeredStudents">{{ students | selectattr('registration_status', 'equalto', 'Registered') | list | length }}</div>
+                </div>
+                <div class="ios-stat-card pink">
+                    <div class="ios-stat-label">Login Path</div>
+                    <div class="ios-stat-value" style="font-size: 18px;">/student-login</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card" style="margin-top: 24px;">
+            <div style="margin-bottom: 20px;">
+                <span class="badge badge-blue">Registered Students</span>
+                <h2 style="font-size: 20px; margin-top: 8px;">Portal Access Register</h2>
+            </div>
+
+            <div style="overflow-x: auto;">
+                <table class="ios-table">
+                    <thead>
+                        <tr>
+                            <th>Student</th>
+                            <th>Programme</th>
+                            <th>Portal Login</th>
+                            <th>Status</th>
+                            <th>Coordinator</th>
+                            <th>Profile</th>
+                        </tr>
+                    </thead>
+                    <tbody id="studentTableBody">
+                        {% for student in students %}
+                        <tr>
+                            <td>
+                                <strong>{{ student.full_name }}</strong><br>
+                                <small style="color: var(--text-tertiary);">{{ student.student_number }} | {{ student.email }}</small>
+                            </td>
+                            <td>
+                                {{ student.programme }}<br>
+                                <small style="color: var(--text-tertiary);">{{ student.location }} | {{ student.start_date }}</small>
+                            </td>
+                            <td>
+                                <span class="badge badge-green">{{ student.username }}</span><br>
+                                <small style="color: var(--text-tertiary);">{{ student.password }}</small>
+                            </td>
+                            <td><span class="badge badge-blue">{{ student.status }}</span></td>
+                            <td>{{ student.coordinator }}</td>
+                            <td><a class="btn btn-secondary btn-pill" href="{{ url_for('learner_profile', student_id=student.id) }}">Open</a></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        const registerForm = document.getElementById("studentRegisterForm");
+        const messageBox = document.getElementById("formMessage");
+        const tableBody = document.getElementById("studentTableBody");
+
+        function showMessage(text, type) {
+            messageBox.className = `message-box ${type}`;
+            messageBox.textContent = text;
+            messageBox.style.display = "block";
+            if (type === "success") {
+                messageBox.style.background = "rgba(52, 199, 89, 0.15)";
+                messageBox.style.color = "#34C759";
+            } else {
+                messageBox.style.background = "rgba(255, 59, 48, 0.15)";
+                messageBox.style.color = "#FF3B30";
+            }
+        }
+
+        function renderStudents(students) {
+            tableBody.innerHTML = "";
+            students.forEach(student => {
+                tableBody.innerHTML += `
+                    <tr>
+                        <td><strong>${student.full_name}</strong><br><small style="color: var(--text-tertiary);">${student.student_number} | ${student.email}</small></td>
+                        <td>${student.programme}<br><small style="color: var(--text-tertiary);">${student.location} | ${student.start_date}</small></td>
+                        <td><span class="badge badge-green">${student.username}</span><br><small style="color: var(--text-tertiary);">${student.password}</small></td>
+                        <td><span class="badge badge-blue">${student.status}</span></td>
+                        <td>${student.coordinator}</td>
+                        <td><a class="btn btn-secondary btn-pill" href="/learners/${student.id}">Open</a></td>
+                    </tr>
+                `;
+            });
+
+            document.getElementById("totalStudents").innerText = students.length;
+            document.getElementById("activeStudents").innerText = students.filter(student => student.status === "Active").length;
+            document.getElementById("registeredStudents").innerText = students.filter(student => student.registration_status === "Registered").length;
+        }
+
+        registerForm.addEventListener("submit", async (event) => {
+            event.preventDefault();
+            showMessage("", "");
+
+            const formData = new FormData(registerForm);
+            const response = await fetch("/api/admin/students", {
+                method: "POST",
+                body: formData
+            });
+            const data = await response.json();
+
+            if (!response.ok) {
+                showMessage(data.message || "Unable to register the student.", "error");
+                return;
+            }
+
+            showMessage(data.message, "success");
+            document.getElementById("latestUsername").innerText = data.student.username;
+            document.getElementById("latestPassword").innerText = data.student.password;
+            registerForm.reset();
+            renderStudents(data.students);
+        });
+    </script>
+</body>
+</html>
